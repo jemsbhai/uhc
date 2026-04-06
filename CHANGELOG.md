@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-04-05
+
+### Added
+- **Sliding rope algorithm** (Definition 10, Theorem 11, Lemma 12): bounded-memory CDH via `SlidingRopeState` class with eviction. Memory independent of decoded size N — depends only on W = d_max + m_max.
+- `CDHMethod.SLIDING_ROPE` — third CDH strategy, configurable via `d_max` and `m_max` parameters
+- Runtime validation: raises `ValueError` if back-reference distance exceeds window or decoded length
+- Direct invariant I_slide verification tests: checks conditions (3), (4), (5) after every single token
+- Boundary condition tests: d = d_max exactly, window at W vs W+1, eviction trim to d_max, invalid parameter rejection
+- 84 new tests (292 total), including 15 randomized step-by-step invariant proofs and three-way cross-validation (prefix_array, rope, sliding_rope)
+
 ## [0.1.1] - 2026-04-05
 
 ### Added
