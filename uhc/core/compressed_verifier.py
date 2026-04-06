@@ -203,8 +203,6 @@ def _fill_prefix_hashes(
             prefix_hashes[source_pos + 1]
             - mersenne_mul(prefix_hashes[source_pos], base, p)
         ) % p
-        if byte_hash < 0:
-            byte_hash += p
         prev = prefix_hashes[pos + k]
         prefix_hashes.append(mersenne_mod(prev * base + byte_hash, p))
 

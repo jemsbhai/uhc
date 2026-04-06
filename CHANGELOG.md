@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-04-06
+
+### Added
+- **Theorem 23: BLAKE3 integrity composition** (`uhc/core/integrity.py`):
+  - `integrity_fast()` — CDH^(k) only, O(k·c_F·n), collision bound (N/p)^k (Theorem 23a)
+  - `integrity_full()` — CDH^(k) + BLAKE3(T), cryptographic collision resistance (Theorem 23b)
+  - `IncrementalIntegrity` — list-based incremental CDH + BLAKE3, O(k) add, O(k·m) remove (Theorem 23c)
+  - `RopeIncrementalIntegrity` — rope-based incremental CDH via Theorems 6-7, O(k·log m) add/remove for CDH component (Theorem 23c)
+- **`MERSENNE_127` constant** (`polynomial_hash.py`): p = 2^127−1, the recommended prime for high-security configurations (Corollary 5: collision bound < 2^(−174) for 1 TB files with k=2)
+- Cross-format integrity tests: BLAKE3 + CDH verified across DEFLATE, gzip, and Zstandard
+- 4 new tests (702 total)
+
+### Fixed
+- Removed dead code in `_fill_prefix_hashes` (unreachable `if byte_hash < 0` after Python `% p`)
+- Corrected complexity documentation in `RopeIncrementalIntegrity`: BLAKE3 removal is O(N_remaining), not O(k·log m)
+
+### Framework completeness
+- All 24 theorems, 14 lemmas, 5 corollaries, 10 definitions now implemented and tested
+- Zero unresolved assumptions
+
 ## [0.1.4] - 2026-04-06
 
 ### Added

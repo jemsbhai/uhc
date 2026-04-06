@@ -3,7 +3,7 @@
 [![PyPI version](https://img.shields.io/pypi/v/uhc)](https://pypi.org/project/uhc/)
 [![Python 3.10+](https://img.shields.io/pypi/pyversions/uhc)](https://pypi.org/project/uhc/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-670%2B%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-702%20passing-brightgreen)]()
 
 A Python framework for **compressed-domain hashing** (CDH) over LZ77 streams.
 
@@ -462,7 +462,7 @@ python -m pytest tests/ -v
 
 ### Test suite
 
-670+ tests across 18 test files covering:
+702 tests across 19 test files covering:
 
 - **Algebraic foundations:** polynomial hash, geometric accumulator Φ, Mersenne prime arithmetic
 - **LZ77 encode/decode:** overlapping back-references, boundary cases, round-trip correctness

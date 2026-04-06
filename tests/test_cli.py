@@ -209,7 +209,7 @@ class TestVersionOutput:
         cli.run(["--version"])
         # argparse prints version and exits with 0
         assert cli.exit_code == 0
-        assert "0.1.4" in cli.stdout or "uhc" in cli.stdout.lower()
+        assert "0.1.5" in cli.stdout or "uhc" in cli.stdout.lower()
 
 
 # ===================================================================

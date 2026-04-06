@@ -6,5 +6,5 @@ Computes polynomial hashes of uncompressed data directly from
 compressed token representations without decompression.
 """
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 __author__ = "UHC Contributors"
