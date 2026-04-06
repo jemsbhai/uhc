@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-04-05
+
+### Added
+- **k-tuple multi-hash** (`uhc/core/multihash.py`): `MultiHash` class wrapping k independent `PolynomialHash` instances. `multi_cdh()` and `multi_cdh_sliding()` compute k-tuple CDH. Implements Theorems 20-21, Corollary 5. Collision bound drops from N/p to (N/p)^k.
+- **DEFLATE token extractor** (`uhc/core/deflate.py`): Pure-Python RFC 1951 parser extracting Lit/Ref tokens from raw DEFLATE streams. Handles stored, fixed Huffman, and dynamic Huffman blocks. Satisfies conditions C1/C2 (Lemma 9).
+- **LZ4 token extractor** (`uhc/core/lz4_parser.py`): Parser for both raw LZ4 block format and LZ4 frame format. Handles 255-continuation scheme for long literals/matches. Satisfies conditions C1/C2 (Lemma 10).
+- **Content-Defined Chunking** (`uhc/chunking/cdc.py`): Gear-based FastCDC implementation with normalized two-level masking. Configurable min/avg/max chunk sizes. Deterministic, content-defined boundaries.
+- **Unified pipeline API** (`uhc/engine/pipeline.py`): Clean public interface — `uhc_hash()`, `uhc_hash_compressed()`, `uhc_hash_multi()`, `uhc_verify()`. Supports DEFLATE, LZ4 (block + frame), and RAW formats. Cross-format verification (e.g., compare DEFLATE vs LZ4 of same data).
+- **End-to-end integration tests**: Full pipeline validation — CDC → compress → extract tokens → CDH → compose. Cross-format consistency, deduplication scenarios, randomized testing.
+- 212 new tests (504 total)
+
 ## [0.1.2] - 2026-04-05
 
 ### Added
