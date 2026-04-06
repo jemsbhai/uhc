@@ -5,7 +5,7 @@ Provides a clean public API that wires together:
     CDC chunking → compression format parsing → CDH → hash composition
 
 Supports:
-    - DEFLATE and LZ4 compressed inputs (Lemmas 9-10)
+    - DEFLATE, LZ4, and Zstandard compressed inputs (Lemmas 9-11)
     - Raw byte inputs (auto-compressed for CDH)
     - Single-hash and k-tuple multi-hash (Theorems 12, 21)
     - Streaming (chunk-at-a-time) and one-shot modes
@@ -33,7 +33,9 @@ from uhc.core.polynomial_hash import PolynomialHash, MERSENNE_61
 from uhc.core.lz77 import Token
 from uhc.core.compressed_verifier import compressed_domain_hash, CDHMethod
 from uhc.core.deflate import deflate_extract_tokens
+from uhc.core.gzip_parser import gzip_extract_tokens
 from uhc.core.lz4_parser import lz4_extract_tokens, lz4_frame_extract_tokens
+from uhc.core.zstd_parser import zstd_extract_tokens
 from uhc.core.multihash import MultiHash, multi_cdh
 from uhc.chunking.cdc import cdc_chunk
 
@@ -46,16 +48,20 @@ from uhc.chunking.cdc import cdc_chunk
 class Format(str, Enum):
     """Supported compression formats."""
     DEFLATE = "deflate"
+    GZIP = "gzip"
     LZ4_BLOCK = "lz4_block"
     LZ4_FRAME = "lz4_frame"
+    ZSTD = "zstd"
     RAW = "raw"  # uncompressed — will auto-compress with DEFLATE
 
 
 # Format → (token extractor, CDH d_max, CDH m_max)
 _FORMAT_CONFIG = {
     Format.DEFLATE:   (deflate_extract_tokens, 32768, 258),
+    Format.GZIP:      (gzip_extract_tokens, 32768, 258),
     Format.LZ4_BLOCK: (lz4_extract_tokens, 65535, 65536),
     Format.LZ4_FRAME: (lz4_frame_extract_tokens, 65535, 65536),
+    Format.ZSTD:      (zstd_extract_tokens, 2**27, 131074),
 }
 
 
@@ -177,7 +183,7 @@ def uhc_hash_compressed(
     data : bytes
         Compressed data.
     fmt : Format
-        Compression format (DEFLATE, LZ4_BLOCK, LZ4_FRAME).
+        Compression format (DEFLATE, LZ4_BLOCK, LZ4_FRAME, ZSTD).
 
     Returns
     -------

@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-04-06
+
+### Added
+- **Zstandard CLI support**: `--format zstd` accepted in all commands (hash, verify, inspect, info, benchmark). Magic byte auto-detection (`28 b5 2f fd`) enabled.
+- **Gzip format** (`uhc/core/gzip_parser.py`): RFC 1952 header parser with support for FEXTRA, FNAME, FCOMMENT, FHCRC fields. `gzip_extract_tokens()` strips the header and delegates to `deflate_extract_tokens()`. `Format.GZIP` wired into pipeline and CLI with magic byte auto-detection (`1f 8b`).
+- **`uhc info` command**: File metadata and token statistics — compressed/decoded size, compression ratio, token counts (literals, references, overlapping references). Text and JSON output.
+- **`uhc benchmark` command**: Times CDH vs decompress-then-hash with configurable trial count. Reports speedup factor and verifies Theorem 12 correctness (CDH = DTH). Text and JSON output.
+- **`--timing` flag**: Shows elapsed wall-clock time on any command. Injects `elapsed_ms` field into JSON output.
+- **`--verbose` / `-v` flag**: Detailed output showing format, method, and token count on hash command.
+- **README overhaul**: Comprehensive rewrite with badges, "How It Works" section, full CLI reference with usage examples for all 6 commands, format table with c_F values, expanded math section, updated architecture tree, citation block. Test count updated to 668.
+- 52 new tests (668 total)
+
+### Changed
+- Gzip magic bytes (`1f 8b`) now map to `Format.GZIP` instead of `Format.DEFLATE` for proper header stripping.
+- `Format` enum gains `GZIP` member; pipeline `_FORMAT_CONFIG` updated accordingly.
+
 ## [0.1.3] - 2026-04-05
 
 ### Added
