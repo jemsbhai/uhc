@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uhc"
+version = "0.1.0"
+description = "Unified Hash-Compression Engine: compressed-domain hashing over LZ77 streams"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "UHC Contributors"},
+]
+keywords = [
+    "compression",
+    "hashing",
+    "lz77",
+    "deduplication",
+    "integrity",
+    "polynomial-hash",
+    "deflate",
+    "zstandard",
+    "lz4",
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Archiving :: Compression",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+formats = [
+    "lz4>=4.0",
+    "zstandard>=0.22",
+    "blake3>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/uhc-framework/uhc"
+Documentation = "https://github.com/uhc-framework/uhc"
+Repository = "https://github.com/uhc-framework/uhc"
+Issues = "https://github.com/uhc-framework/uhc/issues"
+
+[tool.setuptools.packages.find]
+include = ["uhc*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["uhc"]
+omit = ["tests/*"]
