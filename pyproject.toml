@@ -40,6 +40,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.scripts]
+uhc = "uhc.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",

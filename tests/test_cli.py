@@ -1,0 +1,416 @@
+"""
+Tests for the UHC CLI.
+
+Covers:
+    uhc hash — raw, compressed, multi-hash, hex, JSON, quiet, stdin, method, d-max/m-max
+    uhc verify — same, different, cross-format, JSON, quiet exit codes
+    uhc chunks — table, JSON, custom sizes
+    uhc inspect — token dumping, JSON, limit
+    Format autodetection via magic bytes
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import sys
+import zlib
+import tempfile
+import pytest
+
+from uhc.cli import main, build_parser, detect_format
+from uhc.engine.pipeline import Format
+
+
+# ===================================================================
+# Helpers
+# ===================================================================
+
+def _write_temp(data: bytes, suffix: str = ".bin") -> str:
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    os.write(fd, data)
+    os.close(fd)
+    return path
+
+
+def _raw_deflate(data: bytes) -> bytes:
+    c = zlib.compressobj(6, zlib.DEFLATED, -15)
+    return c.compress(data) + c.flush()
+
+
+class CLIRunner:
+    """Run CLI commands and capture output."""
+
+    def __init__(self):
+        self.exit_code = 0
+        self.stdout = ""
+        self.stderr = ""
+
+    def run(self, args: list[str], stdin_data: bytes | None = None) -> "CLIRunner":
+        out, err = io.StringIO(), io.StringIO()
+        old_out, old_err, old_in = sys.stdout, sys.stderr, sys.stdin
+        try:
+            sys.stdout, sys.stderr = out, err
+            if stdin_data is not None:
+                sys.stdin = type("FakeStdin", (), {"buffer": io.BytesIO(stdin_data)})()
+            try:
+                main(args)
+                self.exit_code = 0
+            except SystemExit as e:
+                self.exit_code = e.code if e.code is not None else 0
+        finally:
+            sys.stdout, sys.stderr, sys.stdin = old_out, old_err, old_in
+            self.stdout = out.getvalue()
+            self.stderr = err.getvalue()
+        return self
+
+
+@pytest.fixture
+def cli():
+    return CLIRunner()
+
+
+@pytest.fixture
+def raw_file():
+    data = b"the quick brown fox jumps over the lazy dog " * 20
+    path = _write_temp(data)
+    yield path, data
+    os.unlink(path)
+
+
+@pytest.fixture
+def deflate_file():
+    data = b"deflate cli test " * 30
+    compressed = _raw_deflate(data)
+    path = _write_temp(compressed, suffix=".deflate")
+    yield path, data
+    os.unlink(path)
+
+
+# ===================================================================
+# Format autodetection
+# ===================================================================
+
+
+class TestFormatAutodetect:
+
+    def test_lz4_frame_magic(self):
+        assert detect_format(b"\x04\x22\x4d\x18" + b"\x00" * 10) == Format.LZ4_FRAME
+
+    def test_gzip_magic(self):
+        assert detect_format(b"\x1f\x8b" + b"\x00" * 10) == Format.DEFLATE
+
+    def test_unknown_returns_none(self):
+        assert detect_format(b"\x00\x00\x00\x00") is None
+
+    def test_short_data_returns_none(self):
+        assert detect_format(b"\x00") is None
+
+
+# ===================================================================
+# Parser
+# ===================================================================
+
+
+class TestParser:
+
+    def test_hash_subcommand(self):
+        parser = build_parser()
+        args = parser.parse_args(["hash", "file.bin"])
+        assert args.command == "hash"
+        assert args.file == "file.bin"
+
+    def test_hash_with_method(self):
+        parser = build_parser()
+        args = parser.parse_args(["hash", "f.bin", "--method", "sliding_rope"])
+        assert args.method == "sliding_rope"
+
+    def test_hash_with_d_max_m_max(self):
+        parser = build_parser()
+        args = parser.parse_args(["hash", "f.bin", "--d-max", "1000", "--m-max", "500"])
+        assert args.d_max == 1000
+        assert args.m_max == 500
+
+    def test_verify_subcommand(self):
+        parser = build_parser()
+        args = parser.parse_args(["verify", "a.bin", "b.bin"])
+        assert args.command == "verify"
+
+    def test_chunks_subcommand(self):
+        parser = build_parser()
+        args = parser.parse_args(["chunks", "file.bin"])
+        assert args.command == "chunks"
+
+    def test_inspect_subcommand(self):
+        parser = build_parser()
+        args = parser.parse_args(["inspect", "f.bin", "-f", "deflate"])
+        assert args.command == "inspect"
+
+    def test_no_subcommand_fails(self, cli):
+        cli.run([])
+        assert cli.exit_code != 0
+
+
+# ===================================================================
+# uhc hash
+# ===================================================================
+
+
+class TestHashCommand:
+
+    def test_hash_raw_file(self, cli, raw_file):
+        path, data = raw_file
+        cli.run(["hash", path])
+        assert cli.exit_code == 0
+        from uhc.core.polynomial_hash import PolynomialHash
+        expected = str(PolynomialHash(base=131).hash(data))
+        assert expected in cli.stdout
+
+    def test_hash_deflate_file(self, cli, deflate_file):
+        path, data = deflate_file
+        cli.run(["hash", path, "-f", "deflate"])
+        assert cli.exit_code == 0
+        from uhc.core.polynomial_hash import PolynomialHash
+        expected = str(PolynomialHash(base=131).hash(data))
+        assert expected in cli.stdout
+
+    def test_hash_with_multihash(self, cli, raw_file):
+        path, _ = raw_file
+        cli.run(["hash", path, "--bases", "131", "257"])
+        assert cli.exit_code == 0
+        assert "," in cli.stdout
+
+    def test_hash_hex_output(self, cli, raw_file):
+        path, _ = raw_file
+        cli.run(["hash", path, "--hex"])
+        assert cli.exit_code == 0
+        line = cli.stdout.strip().split("\n")[0].strip()
+        assert all(c in "0123456789abcdef" for c in line)
+
+    def test_hash_json_output(self, cli, raw_file):
+        path, data = raw_file
+        cli.run(["hash", path, "-o", "json"])
+        assert cli.exit_code == 0
+        out = json.loads(cli.stdout)
+        assert "hash" in out
+        assert "hash_hex" in out
+        assert out["format"] == "raw"
+        from uhc.core.polynomial_hash import PolynomialHash
+        assert out["hash"] == PolynomialHash(base=131).hash(data)
+
+    def test_hash_json_multihash(self, cli, raw_file):
+        path, _ = raw_file
+        cli.run(["hash", path, "--bases", "131", "257", "-o", "json"])
+        assert cli.exit_code == 0
+        out = json.loads(cli.stdout)
+        assert out["k"] == 2
+        assert len(out["hashes"]) == 2
+
+    def test_hash_quiet(self, cli, raw_file):
+        path, _ = raw_file
+        cli.run(["hash", path, "-q"])
+        assert cli.exit_code == 0
+        # Should be just the hash value, nothing else
+        assert cli.stdout.strip().isdigit()
+
+    def test_hash_method_sliding_rope(self, cli, deflate_file):
+        path, data = deflate_file
+        cli.run(["hash", path, "-f", "deflate", "--method", "sliding_rope"])
+        assert cli.exit_code == 0
+        from uhc.core.polynomial_hash import PolynomialHash
+        expected = str(PolynomialHash(base=131).hash(data))
+        assert expected in cli.stdout
+
+    def test_hash_method_prefix_array(self, cli, deflate_file):
+        path, data = deflate_file
+        cli.run(["hash", path, "-f", "deflate", "--method", "prefix_array"])
+        assert cli.exit_code == 0
+        from uhc.core.polynomial_hash import PolynomialHash
+        expected = str(PolynomialHash(base=131).hash(data))
+        assert expected in cli.stdout
+
+    def test_hash_custom_d_max_m_max(self, cli, deflate_file):
+        path, data = deflate_file
+        cli.run(["hash", path, "-f", "deflate", "--method", "sliding_rope",
+                  "--d-max", "32768", "--m-max", "258"])
+        assert cli.exit_code == 0
+        from uhc.core.polynomial_hash import PolynomialHash
+        expected = str(PolynomialHash(base=131).hash(data))
+        assert expected in cli.stdout
+
+    def test_hash_stdin(self, cli):
+        data = b"stdin hash test"
+        cli.run(["hash", "-"], stdin_data=data)
+        assert cli.exit_code == 0
+        from uhc.core.polynomial_hash import PolynomialHash
+        expected = str(PolynomialHash(base=131).hash(data))
+        assert expected in cli.stdout
+
+    def test_hash_nonexistent_file(self, cli):
+        cli.run(["hash", "nonexistent_file.bin"])
+        assert cli.exit_code != 0
+
+
+# ===================================================================
+# uhc verify
+# ===================================================================
+
+
+class TestVerifyCommand:
+
+    def test_same_file(self, cli, raw_file):
+        path, _ = raw_file
+        cli.run(["verify", path, path])
+        assert cli.exit_code == 0
+        assert "match" in cli.stdout.lower()
+
+    def test_different_files(self, cli):
+        p1 = _write_temp(b"file one content")
+        p2 = _write_temp(b"file two content")
+        try:
+            cli.run(["verify", p1, p2])
+            assert "mismatch" in cli.stdout.lower() or cli.exit_code != 0
+        finally:
+            os.unlink(p1)
+            os.unlink(p2)
+
+    def test_raw_vs_deflate(self, cli):
+        data = b"cross format verify cli " * 20
+        p_raw = _write_temp(data)
+        p_deflate = _write_temp(_raw_deflate(data))
+        try:
+            cli.run(["verify", p_raw, p_deflate,
+                      "--format-a", "raw", "--format-b", "deflate"])
+            assert cli.exit_code == 0
+            assert "match" in cli.stdout.lower()
+        finally:
+            os.unlink(p_raw)
+            os.unlink(p_deflate)
+
+    def test_verify_json_output(self, cli, raw_file):
+        path, _ = raw_file
+        cli.run(["verify", path, path, "-o", "json"])
+        assert cli.exit_code == 0
+        out = json.loads(cli.stdout)
+        assert out["match"] is True
+
+    def test_verify_quiet_match(self, cli, raw_file):
+        path, _ = raw_file
+        cli.run(["verify", path, path, "-q"])
+        assert cli.exit_code == 0
+        assert cli.stdout.strip() == ""  # quiet match = no output, exit 0
+
+    def test_verify_quiet_mismatch(self, cli):
+        p1 = _write_temp(b"aaa")
+        p2 = _write_temp(b"bbb")
+        try:
+            cli.run(["verify", p1, p2, "-q"])
+            assert cli.exit_code == 1  # quiet mismatch = exit 1
+        finally:
+            os.unlink(p1)
+            os.unlink(p2)
+
+    def test_verify_nonexistent(self, cli, raw_file):
+        path, _ = raw_file
+        cli.run(["verify", path, "nonexistent.bin"])
+        assert cli.exit_code != 0
+
+
+# ===================================================================
+# uhc chunks
+# ===================================================================
+
+
+class TestChunksCommand:
+
+    def test_chunks_output(self, cli):
+        data = b"chunk cli test " * 2000
+        path = _write_temp(data)
+        try:
+            cli.run(["chunks", path])
+            assert cli.exit_code == 0
+            lines = cli.stdout.strip().split("\n")
+            assert len(lines) >= 3
+        finally:
+            os.unlink(path)
+
+    def test_chunks_json(self, cli):
+        data = b"chunk json " * 2000
+        path = _write_temp(data)
+        try:
+            cli.run(["chunks", path, "-o", "json"])
+            assert cli.exit_code == 0
+            out = json.loads(cli.stdout)
+            assert "chunks" in out
+            assert out["total_bytes"] == len(data)
+            assert out["num_chunks"] > 0
+        finally:
+            os.unlink(path)
+
+    def test_chunks_custom_sizes(self, cli):
+        data = b"custom chunks " * 3000
+        path = _write_temp(data)
+        try:
+            cli.run(["chunks", path, "--min-size", "1024",
+                      "--avg-size", "4096", "--max-size", "16384"])
+            assert cli.exit_code == 0
+        finally:
+            os.unlink(path)
+
+    def test_chunks_small_file(self, cli):
+        path = _write_temp(b"tiny")
+        try:
+            cli.run(["chunks", path])
+            assert cli.exit_code == 0
+            assert "1 chunk" in cli.stdout.lower() or "1" in cli.stdout
+        finally:
+            os.unlink(path)
+
+    def test_chunks_stdin(self, cli):
+        data = b"stdin chunk test " * 2000
+        cli.run(["chunks", "-"], stdin_data=data)
+        assert cli.exit_code == 0
+
+
+# ===================================================================
+# uhc inspect
+# ===================================================================
+
+
+class TestInspectCommand:
+
+    def test_inspect_deflate(self, cli, deflate_file):
+        path, _ = deflate_file
+        cli.run(["inspect", path, "-f", "deflate"])
+        assert cli.exit_code == 0
+        assert "Lit(" in cli.stdout or "Ref(" in cli.stdout
+
+    def test_inspect_json(self, cli, deflate_file):
+        path, _ = deflate_file
+        cli.run(["inspect", path, "-f", "deflate", "-o", "json"])
+        assert cli.exit_code == 0
+        out = json.loads(cli.stdout)
+        assert "tokens" in out
+        assert out["total_tokens"] > 0
+
+    def test_inspect_limit(self, cli, deflate_file):
+        path, _ = deflate_file
+        cli.run(["inspect", path, "-f", "deflate", "-n", "5"])
+        assert cli.exit_code == 0
+        # Should show at most 5 token lines
+        token_lines = [l for l in cli.stdout.split("\n")
+                       if "Lit(" in l or "Ref(" in l]
+        assert len(token_lines) <= 5
+
+    def test_inspect_raw_format_rejected(self, cli, raw_file):
+        path, _ = raw_file
+        cli.run(["inspect", path, "-f", "raw"])
+        assert cli.exit_code != 0
+
+    def test_inspect_stdin(self, cli):
+        data = b"inspect stdin " * 20
+        compressed = _raw_deflate(data)
+        cli.run(["inspect", "-", "-f", "deflate"], stdin_data=compressed)
+        assert cli.exit_code == 0
+        assert "Lit(" in cli.stdout or "Ref(" in cli.stdout
