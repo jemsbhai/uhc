@@ -5,14 +5,21 @@ Computes H(T) from an LZ77 token stream using algebraic composition
 (Theorems 1, 2, 5) rather than byte-by-byte hashing. This is the
 code-level proof of Theorem 12: CDH(τ) = H(T).
 
-This initial implementation uses a prefix hash array for substring
-queries (Corollary 2), which requires O(N) space. The rope-based
-implementation (Part III of the framework) will replace this to
-achieve sub-linear space.
+Two back-end strategies are provided:
+
+  - "prefix_array" (Corollary 2): O(N) space prefix hash array.
+    Simple, fast per-token, but requires space linear in decoded size.
+
+  - "rope" (Part III, Theorems 6-10): O(n·log N) hash rope.
+    Sub-linear space — never materializes the decoded stream.
+
+Both must produce identical results for all inputs. The `method`
+parameter selects which strategy to use.
 """
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Sequence
 
 from uhc.core.polynomial_hash import (
@@ -23,31 +30,36 @@ from uhc.core.polynomial_hash import (
     MERSENNE_61,
 )
 from uhc.core.lz77 import Token, Literal, Reference
+from uhc.core.rope import (
+    Leaf,
+    rope_concat,
+    rope_split,
+    rope_repeat,
+    rope_substr_hash,
+    rope_len,
+    rope_hash,
+    Node,
+)
+
+
+class CDHMethod(str, Enum):
+    """Strategy for substring queries during compressed-domain hashing."""
+    PREFIX_ARRAY = "prefix_array"
+    ROPE = "rope"
 
 
 def compressed_domain_hash(
     tokens: Sequence[Token],
     prime: int = MERSENNE_61,
     base: int = 131,
+    method: str | CDHMethod = CDHMethod.ROPE,
 ) -> int:
     """
     Compute the polynomial hash of the decoded data directly from
     an LZ77 token stream, using algebraic composition.
 
-    This implements the algorithm from Theorem 11 and proves
+    Implements the algorithm from Theorem 11 and proves
     Theorem 12: CDH(τ) = H(T).
-
-    The hash is built incrementally using three rules:
-
-    1. Literal(c):
-       h = h · x + (c + 1)                              [Definition 2]
-
-    2. Ref(d, l) with d ≥ l (non-overlapping):
-       h = h · x^l + H(source)                           [Theorem 1]
-
-    3. Ref(d, l) with d < l (overlapping):
-       h = h · x^l + H(P)·Φ(q, x^d)·x^r + H(P[0..r-1]) [Theorem 5]
-       where q = ⌊l/d⌋, r = l mod d
 
     Parameters
     ----------
@@ -57,30 +69,44 @@ def compressed_domain_hash(
         Mersenne prime for the hash ring.
     base : int
         Hash base x.
+    method : str or CDHMethod
+        "prefix_array" — O(N) space, prefix hash array (Corollary 2).
+        "rope" — O(n·log N) space, hash rope (Part III).
 
     Returns
     -------
     int
         H(decoded data), computed without full decompression.
     """
+    method = CDHMethod(method)
+    if method == CDHMethod.PREFIX_ARRAY:
+        return _cdh_prefix_array(tokens, prime, base)
+    elif method == CDHMethod.ROPE:
+        return _cdh_rope(tokens, prime, base)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+
+# ---------------------------------------------------------------------------
+# Strategy 1: Prefix hash array (Corollary 2) — O(N) space
+# ---------------------------------------------------------------------------
+
+
+def _cdh_prefix_array(
+    tokens: Sequence[Token],
+    prime: int,
+    base: int,
+) -> int:
+    """Original implementation using prefix hash array."""
     h = PolynomialHash(prime=prime, base=base)
     p = prime
 
-    # Running hash of T[0..pos-1], built algebraically
     h_running = 0
-
-    # Prefix hash array for substring queries (Corollary 2).
-    # prefix_hashes[k] = H(T[0..k-1]), with prefix_hashes[0] = 0.
-    # This will be replaced by the rope data structure in the
-    # production implementation.
     prefix_hashes: list[int] = [0]
-
-    # Current decoded position
     pos = 0
 
     for tok in tokens:
         if isinstance(tok, Literal):
-            # Rule 1: h = h · x + (c + 1)
             c = tok.byte
             h_running = mersenne_mod(h_running * base + c + 1, p)
             pos += 1
@@ -90,72 +116,42 @@ def compressed_domain_hash(
             d, l = tok.distance, tok.length
 
             if d >= l:
-                # Rule 2: Non-overlapping (Theorem 1)
-                # Source: T[pos-d .. pos-d+l-1]
-                # H(source) via Corollary 2:
-                #   H(T[a..b]) = P[b+1] - P[a] · x^(b-a+1)
                 a = pos - d
-                h_source = _substr_hash(prefix_hashes, a, l, h, p)
-
-                # h_running = h_running · x^l + H(source)
+                h_source = _substr_hash_prefix(prefix_hashes, a, l, h, p)
                 x_l = h.power(l)
                 h_running = mersenne_mod(h_running * x_l + h_source, p)
-
             else:
-                # Rule 3: Overlapping (Theorem 5)
-                # Pattern P = T[pos-d .. pos-1], length d
-                # W = P^q ‖ P[0..r-1]
                 q, r = divmod(l, d)
-
-                # H(P) via Corollary 2
                 a = pos - d
-                h_pattern = _substr_hash(prefix_hashes, a, d, h, p)
-
-                # H(P[0..r-1]) via Corollary 2 (if r > 0)
-                if r > 0:
-                    h_prefix = _substr_hash(prefix_hashes, a, r, h, p)
-                else:
-                    h_prefix = 0
-
-                # Theorem 5: H(W) = H(P)·Φ(q, x^d)·x^r + H(P[0..r-1])
+                h_pattern = _substr_hash_prefix(prefix_hashes, a, d, h, p)
+                h_prefix = (
+                    _substr_hash_prefix(prefix_hashes, a, r, h, p) if r > 0 else 0
+                )
                 x_d = h.power(d)
                 x_r = h.power(r)
                 phi_val = phi(q, x_d, p)
-
                 h_w = mersenne_mod(
                     mersenne_mul(mersenne_mul(h_pattern, phi_val, p), x_r, p)
                     + h_prefix,
                     p,
                 )
-
-                # h_running = h_running · x^l + H(W)    [Theorem 1]
                 x_l = h.power(l)
                 h_running = mersenne_mod(h_running * x_l + h_w, p)
 
-            # Update prefix hashes for the decoded bytes.
-            # We must fill in prefix_hashes[pos+1] through prefix_hashes[pos+l].
-            # These are computed from h_running and the intermediate positions.
-            #
-            # For intermediate positions, we decode byte-by-byte (needed for
-            # future substring queries). This is the part the rope replaces.
             _fill_prefix_hashes(prefix_hashes, pos, d, l, p, base)
             pos += l
 
     return h_running
 
 
-def _substr_hash(
+def _substr_hash_prefix(
     prefix_hashes: list[int],
     start: int,
     length: int,
     h: PolynomialHash,
     p: int,
 ) -> int:
-    """
-    Compute H(T[start..start+length-1]) from prefix hashes (Corollary 2).
-
-    H(T[a..b]) = P[b+1] - P[a] · x^(b-a+1) (mod p)
-    """
+    """H(T[start..start+length-1]) from prefix hashes (Corollary 2)."""
     if length == 0:
         return 0
     a = start
@@ -175,31 +171,67 @@ def _fill_prefix_hashes(
     p: int,
     base: int,
 ) -> None:
-    """
-    Fill prefix_hashes[pos+1] through prefix_hashes[pos+l] for a
-    back-reference Ref(d, l) at position pos.
-
-    The decoded bytes are T[pos+k] = T[pos - d + (k mod d)] for k=0..l-1.
-    We look up each byte's contribution from earlier prefix hashes and
-    extend incrementally.
-
-    This is the O(l) auxiliary work that the rope data structure eliminates.
-    """
+    """Fill prefix_hashes for a back-reference. O(l) auxiliary work."""
     for k in range(l):
-        # The byte at position pos+k equals the byte at pos - d + (k mod d)
-        # We recover its value from the prefix hash difference at that position
         source_pos = pos - d + (k % d)
-
-        # Recover byte value: H(T[source_pos]) = P[source_pos+1] - P[source_pos] · x
         byte_hash = (
             prefix_hashes[source_pos + 1]
             - mersenne_mul(prefix_hashes[source_pos], base, p)
         ) % p
         if byte_hash < 0:
             byte_hash += p
-        # byte_hash = byte_value + 1 (by Definition 2)
-        # So the byte value is byte_hash - 1
-        # But we don't need the byte value — we need the prefix hash.
-        # P[pos+k+1] = P[pos+k] · x + (byte_value + 1) = P[pos+k] · x + byte_hash
         prev = prefix_hashes[pos + k]
         prefix_hashes.append(mersenne_mod(prev * base + byte_hash, p))
+
+
+# ---------------------------------------------------------------------------
+# Strategy 2: Hash rope (Part III, Theorems 6-10) — O(n·log N) space
+# ---------------------------------------------------------------------------
+
+
+def _cdh_rope(
+    tokens: Sequence[Token],
+    prime: int,
+    base: int,
+) -> int:
+    """
+    Compute CDH using the hash rope for all substring queries.
+
+    This never materializes the decoded byte stream. Back-references
+    are resolved by extracting subtrees from the rope (Split) and
+    constructing RepeatNodes for overlapping copies (Theorem 8).
+
+    Space: O(n · log N) for the rope (no prefix array, no decoded buffer).
+    """
+    h = PolynomialHash(prime=prime, base=base)
+    rope: Node = None
+
+    for tok in tokens:
+        if isinstance(tok, Literal):
+            leaf = Leaf(bytes([tok.byte]), h)
+            rope = rope_concat(rope, leaf, h)
+
+        elif isinstance(tok, Reference):
+            d, l = tok.distance, tok.length
+            pos = rope_len(rope)
+
+            if d >= l:
+                # Non-overlapping: extract source subtree from rope
+                start = pos - d
+                _, tmp = rope_split(rope, start, h)
+                source, _ = rope_split(tmp, l, h)
+                rope = rope_concat(rope, source, h)
+            else:
+                # Overlapping: extract pattern of length d, repeat
+                start = pos - d
+                _, tmp = rope_split(rope, start, h)
+                pattern, _ = rope_split(tmp, d, h)
+
+                q, r = divmod(l, d)
+                rep: Node = rope_repeat(pattern, q, h) if q >= 1 else None
+                if r > 0:
+                    partial, _ = rope_split(pattern, r, h)
+                    rep = rope_concat(rep, partial, h)
+                rope = rope_concat(rope, rep, h)
+
+    return rope_hash(rope) if rope else 0

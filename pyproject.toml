@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "uhc"
-version = "0.1.0"
+version = "0.1.1"
 description = "Unified Hash-Compression Engine: compressed-domain hashing over LZ77 streams"
 readme = "README.md"
 license = {text = "MIT"}
@@ -52,10 +52,10 @@ formats = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/uhc-framework/uhc"
-Documentation = "https://github.com/uhc-framework/uhc"
-Repository = "https://github.com/uhc-framework/uhc"
-Issues = "https://github.com/uhc-framework/uhc/issues"
+Homepage = "https://github.com/jemsbhai/uhc"
+Documentation = "https://github.com/jemsbhai/uhc"
+Repository = "https://github.com/jemsbhai/uhc"
+Issues = "https://github.com/jemsbhai/uhc/issues"
 
 [tool.setuptools.packages.find]
 include = ["uhc*"]
