@@ -279,16 +279,29 @@ def _decode_fse_distribution(reader: _ForwardBitReader,
     while remaining > 0:
         max_val = remaining + 1
         bits_needed = max_val.bit_length()
-        threshold = (1 << bits_needed) - 1 - max_val
+        # Match C reference educational decoder (zstd_decompress.c
+        # FSE_decode_header lines 2238-2252):
+        #   lower_mask = (1 << (bits-1)) - 1
+        #   threshold  = (1 << bits) - 1 - (remaining + 1)
+        #   short:  (val & lower_mask) < threshold  -> rewind 1 bit
+        #   long:   val > lower_mask                -> val -= threshold
+        #   middle: val stays, all bits consumed
+        half = 1 << (bits_needed - 1)
+        threshold = (2 * half - 1) - (remaining + 1)
 
         low = reader.read(bits_needed - 1)
         if low < threshold:
-            value = low
+            count = low
         else:
-            value = low | (reader.read(1) << (bits_needed - 1))
-            value -= threshold
+            extra = reader.read(1)
+            if extra:
+                # Long path: val = low + half, count = val - threshold
+                count = low + half - threshold
+            else:
+                # Middle path: val = low, all bits consumed
+                count = low
 
-        prob = value - 1
+        prob = count - 1
 
         if prob == 0:
             distribution.append(0)
