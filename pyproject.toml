@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "uhc"
-version = "0.1.5"
+version = "0.1.6"
 description = "Unified Hash-Compression Engine: compressed-domain hashing over LZ77 streams"
 readme = "README.md"
 license = {text = "MIT"}
