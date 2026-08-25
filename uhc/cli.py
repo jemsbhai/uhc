@@ -38,6 +38,24 @@ from uhc.core.lz77 import Literal, Reference, lz77_decode
 from uhc.core.resources import DEFAULT_LIMITS, ResourceLimits
 
 
+_POLYNOMIAL_WARNING = (
+    "Experimental polynomial screening only: collisions are possible; this "
+    "result is not proof of equality, integrity, authenticity, or security. "
+    "Use 'uhc verify' for exact decoded-byte comparison."
+)
+_CHUNK_WARNING = (
+    "Experimental chunk boundaries and polynomial chunk hashes only: "
+    "collisions are possible; do not use these values as authoritative "
+    "content identifiers, integrity checks, or security decisions."
+)
+_BENCHMARK_WARNING = (
+    "Experimental local research measurement only: timings and speedups are "
+    "non-decision evidence, are not generalizable performance claims, and are "
+    "outside the release-candidate surface. Parser agreement does not "
+    "independently validate parser correctness."
+)
+
+
 # ---------------------------------------------------------------------------
 # Format autodetection (magic bytes)
 # ---------------------------------------------------------------------------
@@ -192,7 +210,14 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Deprecated compatibility option; validated but not used")
 
     # --- chunks ---
-    p_chunks = sub.add_parser("chunks", help="Show CDC chunk boundaries and hashes")
+    p_chunks = sub.add_parser(
+        "chunks",
+        help="Show experimental CDC boundaries and polynomial hashes",
+        description=(
+            "Show research-only CDC boundaries and polynomial chunk hashes. "
+            "The hashes are probabilistic and non-authoritative."
+        ),
+    )
     p_chunks.add_argument("file", help="Path to file, or '-' for stdin")
     _add_common(p_chunks)
     p_chunks.add_argument("--min-size", type=int, default=2048)
@@ -213,7 +238,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p_info)
 
     # --- benchmark ---
-    p_bench = sub.add_parser("benchmark", help="Benchmark CDH vs decompress-then-hash")
+    p_bench = sub.add_parser(
+        "benchmark",
+        help="Run an experimental, non-decision CDH timing comparison",
+        description=(
+            "Run a local research-only CDH versus decompress-then-hash timing "
+            "comparison. Results are not generalizable performance evidence."
+        ),
+    )
     p_bench.add_argument("file", help="Path to compressed file, or '-' for stdin")
     _add_common(p_bench)
     p_bench.add_argument("--trials", type=int, default=3,
@@ -364,13 +396,16 @@ def _cmd_hash(args: argparse.Namespace) -> None:
                    "hashes_hex": [format(v, "x") for v in result_tuple],
                    "method": method.value,
                    "operation": "probabilistic_polynomial_screening",
-                   "authoritative": False}
+                   "authoritative": False,
+                   "warning": _POLYNOMIAL_WARNING}
             print(json.dumps(out))
-        elif args.quiet:
-            print(", ".join(_format_hash(v, use_hex) for v in result_tuple))
         else:
-            formatted = [_format_hash(v, use_hex) for v in result_tuple]
-            print(", ".join(formatted))
+            print(f"WARNING: {_POLYNOMIAL_WARNING}", file=sys.stderr)
+            if args.quiet:
+                print(", ".join(_format_hash(v, use_hex) for v in result_tuple))
+            else:
+                formatted = [_format_hash(v, use_hex) for v in result_tuple]
+                print(", ".join(formatted))
     else:
         # Single hash
         if fmt == Format.RAW:
@@ -396,12 +431,14 @@ def _cmd_hash(args: argparse.Namespace) -> None:
                    "method": method.value, "base": args.base,
                    "hash": result, "hash_hex": format(result, "x"),
                    "operation": "probabilistic_polynomial_screening",
-                   "authoritative": False}
+                   "authoritative": False,
+                   "warning": _POLYNOMIAL_WARNING}
             print(json.dumps(out))
-        elif args.quiet:
-            print(_format_hash(result, use_hex))
         else:
-            if args.verbose and fmt != Format.RAW:
+            print(f"WARNING: {_POLYNOMIAL_WARNING}", file=sys.stderr)
+            if args.quiet:
+                print(_format_hash(result, use_hex))
+            elif args.verbose and fmt != Format.RAW:
                 print(f"Format:  {fmt.value}")
                 print(f"Method:  {method.value}")
                 print(f"Tokens:  {token_count}")
@@ -476,9 +513,13 @@ def _cmd_chunks(args: argparse.Namespace) -> None:
         avg = len(data) / len(ranges) if ranges else 0
         out = {"file": args.file, "total_bytes": len(data),
                "num_chunks": len(ranges), "avg_chunk_size": round(avg, 1),
+               "operation": "experimental_cdc_polynomial_screening",
+               "authoritative": False,
+               "warning": _CHUNK_WARNING,
                "chunks": chunk_list}
         print(json.dumps(out))
     else:
+        print(f"WARNING: {_CHUNK_WARNING}", file=sys.stderr)
         if not args.quiet:
             print(f"{'#':>4}  {'Offset':>10}  {'Size':>8}  {'Hash'}")
             print(f"{'—'*4}  {'—'*10}  {'—'*8}  {'—'*20}")
@@ -652,12 +693,13 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
             "match": match,
             "comparison": "cdh_vs_parser_reconstructed_polynomial_hash",
             "authoritative": False,
-            "warning": "Agreement does not independently validate parser correctness.",
+            "warning": _BENCHMARK_WARNING,
             "cdh_hash": cdh_hash,
             "dth_hash": dth_hash,
         }
         print(json.dumps(out))
     else:
+        print(f"WARNING: {_BENCHMARK_WARNING}", file=sys.stderr)
         print(f"Format:     {fmt.value}")
         print(f"Method:     {method.value}")
         print(f"Trials:     {trials}")

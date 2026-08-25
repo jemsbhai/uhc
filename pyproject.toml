@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "uhc"
-version = "0.1.6"
-description = "Experimental compressed-domain polynomial hashing over LZ77 streams"
+version = "0.2.0rc1"
+description = "Exact cross-format byte verification with experimental compression parsers"
 readme = "README.python.md"
 license = "MIT"
 license-files = ["LICENSE"]

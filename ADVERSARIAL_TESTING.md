@@ -42,8 +42,16 @@ Install `cargo-fuzz`, then run each checked-in target and corpus:
 
 ```powershell
 cargo install cargo-fuzz
-cargo fuzz run exact_sort fuzz/corpus/exact_sort -- -max_total_time=60
-cargo fuzz run rope_builder fuzz/corpus/rope_builder -- -max_total_time=60
+$UhcFuzzSeed = 20260824
+$UhcFuzzSeconds = 60
+$UhcFuzzMaxLen = 4096
+$UhcFuzzRssMb = 512
+$UhcFuzzLogRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("uhc-fuzz-" + [Guid]::NewGuid())
+New-Item -ItemType Directory -Path $UhcFuzzLogRoot | Out-Null
+cargo fuzz run exact_sort fuzz/corpus/exact_sort -- -seed=$UhcFuzzSeed -max_len=$UhcFuzzMaxLen -rss_limit_mb=$UhcFuzzRssMb -max_total_time=$UhcFuzzSeconds -print_final_stats=1 2>&1 | Tee-Object -FilePath (Join-Path $UhcFuzzLogRoot "exact-sort.log")
+if ($LASTEXITCODE -ne 0) { throw "exact_sort fuzz smoke failed" }
+cargo fuzz run rope_builder fuzz/corpus/rope_builder -- -seed=$UhcFuzzSeed -max_len=$UhcFuzzMaxLen -rss_limit_mb=$UhcFuzzRssMb -max_total_time=$UhcFuzzSeconds -print_final_stats=1 2>&1 | Tee-Object -FilePath (Join-Path $UhcFuzzLogRoot "rope-builder.log")
+if ($LASTEXITCODE -ne 0) { throw "rope_builder fuzz smoke failed" }
 ```
 
 The `exact_sort` target compares CD-Mergesort, CD-Radix, native byte sorting,
@@ -59,10 +67,39 @@ support differs from the normal UHC test matrix. On a supported environment:
 
 ```powershell
 python -m pip install atheris
-python fuzz/python/fuzz_native_differential.py fuzz/corpus/python_native -max_total_time=60
+$UhcFuzzSeed = 20260824
+$UhcFuzzSeconds = 60
+$UhcFuzzMaxLen = 4096
+$UhcFuzzRssMb = 512
+$UhcFuzzLogRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("uhc-atheris-" + [Guid]::NewGuid())
+New-Item -ItemType Directory -Path $UhcFuzzLogRoot | Out-Null
+python fuzz/python/fuzz_native_differential.py fuzz/corpus/python_native -seed=$UhcFuzzSeed -max_len=$UhcFuzzMaxLen -rss_limit_mb=$UhcFuzzRssMb -max_total_time=$UhcFuzzSeconds -print_final_stats=1 2>&1 | Tee-Object -FilePath (Join-Path $UhcFuzzLogRoot "atheris-native-differential.log")
+if ($LASTEXITCODE -ne 0) { throw "Atheris fuzz smoke failed" }
 ```
 
 The target compares strict raw-DEFLATE, gzip, and optional Zstandard acceptance
 and decoded bytes with their native bindings. For ZIP, UHC may reject native
 features outside its documented stored/DEFLATE subset, but anything UHC accepts
 must also be accepted with identical per-entry bytes by Python's `zipfile`.
+
+The target itself rejects inputs above 4096 bytes, caps stream output and token
+counts at 64 KiB, caps each ZIP entry at 32 KiB, caps aggregate ZIP output at
+64 KiB, and caps non-directory ZIP entries at 32. Both native and project
+decode paths enforce those bounds, so a compressed fuzz input cannot fall back
+to the public 1 GiB defaults. The libFuzzer `-rss_limit_mb=512` is an additional
+process guard, not the primary decoded-output limit.
+
+## UHC 09 smoke evidence record
+
+For each bounded smoke, preserve the complete `-print_final_stats=1` log and
+record the candidate commit, operating system, Python/Rust/fuzzer versions,
+corpus path and hash, seed (`20260824`), `max_len` (`4096`), RSS limit (512 MiB),
+requested duration (60 seconds), observed wall duration, executed-input count,
+peak RSS, exit status, crashes/timeouts, and artifact paths. The three log files
+above provide the raw final-statistics evidence; summarize them in
+`UHC09_RELEASE_AUDIT.md` rather than replacing them with an untraceable pass
+statement.
+
+These are intentionally short runtime smokes. A successful 60-second run only
+shows that the harness executed under the stated bounds; it does not replace a
+long fuzz campaign, establish absence of defects, or justify production use.

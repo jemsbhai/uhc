@@ -1,27 +1,44 @@
-# UHC Python package
+# UHC Python 0.2 release candidate
 
-> **RELEASE CONTAINMENT — EXPERIMENTAL / NOT PRODUCTION-SAFE.** `uhc_verify`
-> now strictly decodes with native format implementations, applies a SHA-256
-> precheck, and compares the decoded bytes exactly. It verifies content
-> equality, not authenticity or provenance. The separate polynomial-hash APIs
-> remain probabilistic screening: fixed or known parameters permit constructed
-> collisions. Format token parsers and compressed-domain algorithms remain
-> experimental and are not a production security boundary.
+> **PRERELEASE CONTAINMENT — NOT PRODUCTION-SAFE.** Version `0.2.0rc1` is a
+> Python-only candidate for exact decoded-byte verification and supported
+> parser/resource contracts. It verifies content equality, not authenticity or
+> provenance. It is not a production security boundary.
 
-UHC is a pre-alpha Python research package for computing polynomial hashes over
-raw bytes and LZ77-derived token streams. Its current APIs cover experimental
-format parsing, compressed-domain hash calculation, chunking, and strict
-cross-format byte comparison.
+UHC is a prerelease Python package for strict cross-format byte comparison and
+compression-format parsing. It also retains experimental compressed-domain
+polynomial hashing and chunking APIs for explicitly selected research use.
 
 This document is the Python distribution's release description. The co-located
 Rust crate has a separate manifest and release description, and neither its
 sources nor the surrounding research artifacts are Python release inputs.
 
+## Release-candidate scope
+
+The only candidate surface in `0.2.0rc1` is:
+
+- installation and metadata for the pure-Python `uhc` distribution;
+- `uhc_verify_exact`, its compatible `uhc_verify` name, and `uhc verify`;
+- exact raw/DEFLATE/gzip decoding with the standard library, plus exact LZ4 and
+  Zstandard decoding when their optional native bindings are installed;
+- strict rejection behavior for malformed/trailing/ambiguous input, supported
+  token-parser subsets, CLI exit/JSON contracts, and public resource limits.
+
+This candidate does not claim authenticity, denial-of-service resistance,
+general-purpose security screening, or production readiness. The Rust crate,
+sorting work, benchmarks, research evidence, and all publication activity are
+outside the Python candidate.
+
 ## Screening hashes versus exact verification
 
 The `uhc_hash*` functions and `uhc hash` command compute polynomial hashes for
-probabilistic screening. Matching values are not proof that two byte strings
-are equal, and these hashes are not authentication tags. The explicit
+probabilistic screening. Calling those APIs or commands is an explicit research
+opt-in. Matching values are not proof that two byte strings are equal, and
+these hashes are not authentication tags. `uhc chunks` likewise emits
+experimental boundaries and polynomial chunk hashes that must not be treated
+as content identifiers or integrity decisions. Text output sends a warning to
+stderr; JSON output includes `authoritative: false` and a `warning` field.
+The explicit
 `uhc_verify_exact` API and `uhc verify` command strictly decode supported
 formats and compare the decoded bytes. `uhc_verify` remains as a compatible
 name for the same exact operation.
@@ -110,6 +127,9 @@ Native differential tests, deterministic Hypothesis/proptest commands,
 malformed/audit corpus locations, and both fuzzing workflows are documented in
 [`ADVERSARIAL_TESTING.md`](ADVERSARIAL_TESTING.md).
 
-Existing files under `dist/` and `uhc.egg-info/` predate the containment work.
-They are preserved as user-owned generated artifacts but are stale and must not
-be uploaded or treated as release candidates.
+Existing files under `dist/` and `uhc.egg-info/` in the original saved
+workspace predate the containment work. They remain preserved as user-owned
+generated artifacts, but every `0.1.6` artifact is stale and must not be
+uploaded or treated as a release candidate. Candidate artifacts must be built
+from a clean checkout into new external directories and must pass the content
+and metadata validator described in [`QUALITY_GATES.md`](QUALITY_GATES.md).

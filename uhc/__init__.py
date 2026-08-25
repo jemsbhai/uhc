@@ -1,16 +1,15 @@
+"""UHC 0.2 Python release candidate.
+
+The release-candidate surface is strict decoded-byte verification and the
+parser/resource contracts that support it. ``uhc_verify_exact`` (and the
+compatible ``uhc_verify`` name) compares decoded bytes exactly; it does not
+establish authenticity or provenance.
+
+Polynomial hashing, chunk hashes, and compressed-domain algorithms remain
+explicit research opt-ins. Their equality results are probabilistic screening,
+not a production or security decision. The co-located unpublished Rust crate
+is outside this Python release candidate.
 """
-UHC - Unified Hash-Compression Engine
 
-Compressed-domain hashing over LZ77 streams.
-Computes polynomial hashes of uncompressed data directly from
-compressed token representations without decompression.
-
-EXPERIMENTAL: polynomial-hash equality is probabilistic screening, not
-authentication. The public ``uhc_verify_exact`` path (and compatible
-``uhc_verify`` name) strictly decodes and compares bytes exactly, but it does
-not establish authenticity or provenance. Format
-token parsers and compressed-domain algorithms remain pre-alpha.
-"""
-
-__version__ = "0.1.6"
+__version__ = "0.2.0rc1"
 __author__ = "UHC Contributors"

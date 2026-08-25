@@ -5,6 +5,7 @@ include pyproject.toml
 recursive-include uhc *.py
 recursive-include tests *.py
 recursive-include tests/corpus *.hex *.md
+exclude tests/test_fuzz_target_limits.py
 
 # Keep the Python source distribution independent of the co-located Rust crate.
 prune src
@@ -24,6 +25,8 @@ exclude Cargo.lock
 exclude README.md
 exclude README.rust.md
 exclude PROJECT_BOUNDARIES.md
+exclude QUALITY_GATES.md
+exclude UHC09_RELEASE_AUDIT.md
 exclude .coverage
 global-exclude __pycache__
 global-exclude *.py[cod]

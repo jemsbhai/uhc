@@ -13,11 +13,42 @@ import hmac
 import zlib
 from collections.abc import Iterator
 
-from uhc.core.resources import DEFAULT_LIMITS, ResourceLimits
+from uhc.core.resources import DEFAULT_LIMITS, ResourceLimitError, ResourceLimits
 
 
 class ExactDecodeError(ValueError):
     """A compressed input is malformed, truncated, or has trailing data."""
+
+
+def _zstd_window_limit_bytes(limits: ResourceLimits) -> int:
+    """Translate public budgets to the native Zstandard window guard.
+
+    The binding accepts no value below 1 KiB. A declared frame window larger
+    than either the permitted decoded output or reference distance is rejected
+    before the native decoder allocates it.
+    """
+
+    relevant_bytes = min(
+        limits.max_output_bytes,
+        limits.max_reference_distance,
+    )
+    return max(1024, relevant_bytes)
+
+
+def _check_zstd_frame_window(
+    zstd: object,
+    data: bytes,
+    limits: ResourceLimits,
+) -> None:
+    parameters = zstd.get_frame_parameters(data)  # type: ignore[attr-defined]
+    allowed = _zstd_window_limit_bytes(limits)
+    if parameters.window_size > allowed:
+        raise ResourceLimitError(
+            f"Zstandard frame window {parameters.window_size} exceeds "
+            f"resource limit {allowed} derived from "
+            f"max_output_bytes={limits.max_output_bytes} and "
+            f"max_reference_distance={limits.max_reference_distance}"
+        )
 
 
 def _decode_deflate(data: bytes) -> bytes:
@@ -58,7 +89,10 @@ def _decode_gzip(data: bytes) -> bytes:
     return b"".join(chunks)
 
 
-def _decode_zstd(data: bytes) -> bytes:
+def _decode_zstd(
+    data: bytes,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> bytes:
     try:
         import zstandard as zstd
     except ImportError as exc:
@@ -73,8 +107,11 @@ def _decode_zstd(data: bytes) -> bytes:
     remaining = data
     frame = 0
     while remaining:
-        decoder = zstd.ZstdDecompressor().decompressobj()
         try:
+            _check_zstd_frame_window(zstd, remaining, limits)
+            decoder = zstd.ZstdDecompressor(
+                max_window_size=_zstd_window_limit_bytes(limits)
+            ).decompressobj()
             chunks.append(decoder.decompress(remaining) + decoder.flush())
         except zstd.ZstdError as exc:
             raise ExactDecodeError(f"Invalid Zstandard frame {frame}: {exc}") from exc
@@ -156,9 +193,12 @@ def _iter_zstd_native(data: bytes, limits: ResourceLimits) -> Iterator[bytes]:
     )
     frame = 0
     while remaining:
-        decoder = zstd.ZstdDecompressor().decompressobj()
         offset = 0
         try:
+            _check_zstd_frame_window(zstd, remaining, limits)
+            decoder = zstd.ZstdDecompressor(
+                max_window_size=_zstd_window_limit_bytes(limits)
+            ).decompressobj()
             # The binding's decompression object has no max-output argument.
             # A minimal RLE block can expand four input bytes to a 128 KiB
             # Zstandard block. Scale input chunks by that worst-case ratio so

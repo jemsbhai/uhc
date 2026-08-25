@@ -12,6 +12,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0rc1] - Unreleased — UHC 09 release-candidate audit
+
+This is a Python-only prerelease candidate. It does not include or authorize a
+Rust publication, final release, tag, or upload.
+
+### Changed
+
+- Scoped the candidate to exact decoded-byte verification, supported
+  parser/resource contracts, package installation, and CLI/API behavior.
+- Marked polynomial hashing and chunk hashes as explicit research opt-ins, with
+  non-authoritative warnings in both text and JSON CLI output.
+- Raised the Python package version from the stale `0.1.6` identity to
+  `0.2.0rc1`; the Rust crate remains unpublished at `0.1.0`.
+- Strengthened wheel, sdist, and crate inspection to require exact versions,
+  core verification/resource files, release metadata, and clean Rust VCS
+  provenance at the expected commit.
+- Moved candidate builds to fresh external output directories and added
+  install/import/exact-verification smoke checks for both wheel and sdist.
+
+### Security
+
+- No polynomial result is promoted to a security, authentication, integrity,
+  or exact-equality decision. Short fuzz smoke runs remain bounded evidence,
+  not substitutes for long campaigns.
+
 ## [Unreleased] — UHC 06
 
 ### Added

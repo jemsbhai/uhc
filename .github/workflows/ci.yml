@@ -57,10 +57,16 @@ jobs:
       - name: Exercise dependency-free core formats
         run: >-
           python -m pytest
+          tests/test_api_cli_hardening.py
+          tests/test_fuzz_target_limits.py
+          tests/test_streaming_resources.py
+          tests/test_p0_correctness.py
           tests/test_polynomial_hash.py
           tests/test_lz77.py
           tests/test_deflate_parser.py
           tests/test_gzip_parser.py
+      - name: Compile the optional Atheris harness without importing Atheris
+        run: python -m py_compile fuzz/python/fuzz_native_differential.py
 
   python-quality:
     name: Python lint / types / coverage
@@ -96,13 +102,31 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Install package tooling
-        run: python -m pip install ".[dev]"
-      - name: Build wheel and source distribution
-        run: python -m build
-      - name: Validate metadata and artifact boundaries
+        run: python -m pip install "build>=1.2" "twine>=5.1"
+      - name: Build fresh wheel and source distribution externally
+        shell: bash
         run: |
-          python -m twine check dist/*
-          python tools/check_package_contents.py --wheel dist/*.whl --sdist dist/*.tar.gz
+          mkdir -p "$RUNNER_TEMP/python-dist"
+          python -m build --outdir "$RUNNER_TEMP/python-dist"
+      - name: Validate metadata and artifact boundaries
+        shell: bash
+        run: |
+          python -m twine check "$RUNNER_TEMP"/python-dist/*
+          python tools/check_package_contents.py \
+            --wheel "$RUNNER_TEMP/python-dist/uhc-0.2.0rc1-py3-none-any.whl" \
+            --sdist "$RUNNER_TEMP/python-dist/uhc-0.2.0rc1.tar.gz"
+      - name: Install and smoke wheel and source distribution independently
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/wheel-venv"
+          python -m venv "$RUNNER_TEMP/sdist-venv"
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install --no-deps \
+            "$RUNNER_TEMP/python-dist/uhc-0.2.0rc1-py3-none-any.whl"
+          "$RUNNER_TEMP/sdist-venv/bin/python" -m pip install --no-deps \
+            "$RUNNER_TEMP/python-dist/uhc-0.2.0rc1.tar.gz"
+          smoke='import importlib.metadata as metadata, subprocess, sys, zlib, uhc; from uhc.engine.pipeline import Format, uhc_verify_exact; assert metadata.version("uhc") == "0.2.0rc1"; assert uhc.__version__ == "0.2.0rc1"; raw = b"clean artifact exact-verification smoke" * 8; encoder = zlib.compressobj(6, zlib.DEFLATED, -zlib.MAX_WBITS); encoded = encoder.compress(raw) + encoder.flush(); assert uhc_verify_exact(raw, encoded, fmt_a=Format.RAW, fmt_b=Format.DEFLATE); subprocess.run([sys.executable, "-I", "-m", "uhc.cli", "--version"], check=True)'
+          "$RUNNER_TEMP/wheel-venv/bin/python" -I -c "$smoke"
+          "$RUNNER_TEMP/sdist-venv/bin/python" -I -c "$smoke"
 
   rust-tests:
     name: Rust stable / ${{ matrix.os }}
@@ -137,8 +161,11 @@ jobs:
         run: cargo doc --locked --no-deps --all-features
       - name: Build and inspect the unpublished crate
         run: |
-          cargo package --locked
-          python tools/check_package_contents.py --crate target/package/cdh-sort-*.crate
+          cargo package --locked --target-dir "$RUNNER_TEMP/cargo-package-target"
+          python tools/check_package_contents.py \
+            --crate "$RUNNER_TEMP/cargo-package-target/package/cdh-sort-0.1.0.crate" \
+            --expected-vcs-commit "$GITHUB_SHA" \
+            --source-repository .
 
   rust-fuzz-targets:
     name: Rust fuzz targets compile

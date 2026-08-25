@@ -123,6 +123,24 @@ def test_cli_multi_hash_forwards_requested_method(monkeypatch, tmp_path, capsys)
     assert output["method"] == "prefix_array"
     assert output["operation"] == "probabilistic_polynomial_screening"
     assert output["authoritative"] is False
+    assert "collisions are possible" in output["warning"]
+
+
+def test_cli_text_and_chunk_outputs_warn_when_screening(tmp_path, capsys):
+    path = tmp_path / "payload.bin"
+    path.write_bytes(b"screening warning contract" * 20)
+
+    main(["hash", str(path)])
+    captured = capsys.readouterr()
+    assert captured.out.strip().isdigit()
+    assert "warning:" in captured.err.lower()
+    assert "not proof of equality" in captured.err.lower()
+
+    main(["chunks", str(path), "--output", "json"])
+    output = json.loads(capsys.readouterr().out)
+    assert output["authoritative"] is False
+    assert output["operation"] == "experimental_cdc_polynomial_screening"
+    assert "content identifiers" in output["warning"]
 
 
 def test_verify_json_mismatch_exits_one(tmp_path, capsys):

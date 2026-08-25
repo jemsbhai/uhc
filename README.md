@@ -2,8 +2,10 @@
 
 > **RELEASE CONTAINMENT — EXPERIMENTAL / NOT PRODUCTION-SAFE.** This repository
 > temporarily co-locates a Python package and a Rust research crate. Python
-> polynomial-hash APIs remain probabilistic screening, not authentication;
-> `uhc_verify` now uses strict native decoding and exact byte comparison. Rust
+> `0.2.0rc1` is scoped only to exact verification and supported parser/resource
+> contracts. Polynomial-hash APIs remain explicit research opt-ins, not
+> authentication; `uhc_verify` uses strict native decoding and exact byte
+> comparison. Rust
 > LCP/comparison and radix sorting now make exact byte decisions and avoid
 > recursive shared-prefix paths. The Rust verification modules remain
 > scaffolds, resource bounds are not yet established, and neither package is
@@ -19,7 +21,8 @@ rejection, CDH method selection, and checked rope access, are documented in
 
 ## Status
 
-Pre-alpha — implementing the theoretical framework.
+Python: `0.2.0rc1` candidate scope only. Rust: unpublished `0.1.0` research
+prototype (`publish = false`). Neither is production-qualified.
 
 The Python distribution uses [README.python.md](README.python.md); the Rust
 crate uses [README.rust.md](README.rust.md). See

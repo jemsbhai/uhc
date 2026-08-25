@@ -133,6 +133,27 @@ def test_native_frame_decoders_enforce_streaming_expansion_budgets():
         ))
 
 
+def test_zstd_decoder_rejects_window_above_resource_budget():
+    zstd = pytest.importorskip(
+        "zstandard", reason="optional Zstandard binding is not installed"
+    )
+    data = b"W" * (2 * 1024 * 1024)
+    parameters = zstd.ZstdCompressionParameters.from_level(
+        3,
+        window_log=21,
+        write_content_size=0,
+    )
+    encoded = zstd.ZstdCompressor(compression_params=parameters).compress(data)
+    assert zstd.get_frame_parameters(encoded).window_size == 2 * 1024 * 1024
+    limits = ResourceLimits(
+        max_output_bytes=3 * 1024 * 1024,
+        max_reference_distance=1024 * 1024,
+    )
+
+    with pytest.raises(ResourceLimitError, match="frame window"):
+        list(iter_decode_exact(encoded, Format.ZSTD, limits=limits))
+
+
 def test_exact_stream_comparison_handles_different_chunk_boundaries():
     data = b"chunk boundaries must not affect equality" * 1000
     encoded = _raw_deflate(data)

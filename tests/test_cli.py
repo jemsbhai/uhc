@@ -209,7 +209,7 @@ class TestVersionOutput:
         cli.run(["--version"])
         # argparse prints version and exits with 0
         assert cli.exit_code == 0
-        assert "0.1.5" in cli.stdout or "uhc" in cli.stdout.lower()
+        assert "0.2.0rc1" in cli.stdout
 
 
 # ===================================================================
@@ -521,7 +521,7 @@ class TestInfoCommand:
 
 
 class TestBenchmarkCommand:
-    """uhc benchmark — CDH vs DTH timing (Theorem 17)."""
+    """The research-only benchmark always identifies its evidence limits."""
 
     def test_benchmark_deflate(self, cli, deflate_file):
         path, _ = deflate_file
@@ -529,6 +529,8 @@ class TestBenchmarkCommand:
         assert cli.exit_code == 0
         # Should show timing info
         assert "cdh" in cli.stdout.lower() or "time" in cli.stdout.lower()
+        assert "non-decision evidence" in cli.stderr
+        assert "not generalizable" in cli.stderr
 
     def test_benchmark_json(self, cli, deflate_file):
         path, _ = deflate_file
@@ -539,7 +541,10 @@ class TestBenchmarkCommand:
         assert "dth_time" in out
         assert "speedup" in out
         assert "match" in out
-        assert out["match"] is True  # CDH must equal DTH (Theorem 12)
+        assert out["match"] is True
+        assert out["authoritative"] is False
+        assert "non-decision evidence" in out["warning"]
+        assert "not generalizable" in out["warning"]
 
     def test_benchmark_raw_rejected(self, cli, raw_file):
         path, _ = raw_file
