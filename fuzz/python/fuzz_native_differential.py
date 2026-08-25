@@ -98,15 +98,23 @@ def _native_zstd(data: bytes) -> bytes:
     if zstd is None or not data:
         raise ValueError("Zstandard unavailable or empty")
     FUZZ_LIMITS.check_input(len(data))
-    with zstd.ZstdDecompressor(
-        max_window_size=MAX_STREAM_OUTPUT_BYTES
-    ).stream_reader(
-        io.BytesIO(data), read_across_frames=True
-    ) as reader:
-        decoded = reader.read(MAX_STREAM_OUTPUT_BYTES + 1)
-        if len(decoded) > MAX_STREAM_OUTPUT_BYTES or reader.read(1):
-            raise ValueError("native Zstandard output exceeds fuzz limit")
-    return decoded
+    remaining = data
+    output: list[bytes] = []
+    total = 0
+    while remaining:
+        decoder = zstd.ZstdDecompressor(
+            max_window_size=MAX_STREAM_OUTPUT_BYTES
+        ).decompressobj()
+        decoded = decoder.decompress(remaining) + decoder.flush()
+        total = _append_bounded(
+            output, decoded, total, MAX_STREAM_OUTPUT_BYTES
+        )
+        if not decoder.eof:
+            raise ValueError("truncated native Zstandard frame")
+        if decoder.unconsumed_tail:
+            raise ValueError("unconsumed native Zstandard input")
+        remaining = decoder.unused_data
+    return b"".join(output)
 
 
 def _project_tokens(data: bytes, fmt: Format, limits: ResourceLimits) -> bytes:

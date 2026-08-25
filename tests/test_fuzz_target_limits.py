@@ -77,7 +77,7 @@ def test_stream_bomb_is_rejected_by_native_exact_and_token_paths(fuzz_target):
     assert (native_ok, exact_ok, token_ok) == (False, False, False)
 
 
-def test_zstd_native_stream_reader_enforces_output_budget(fuzz_target):
+def test_zstd_native_oracle_enforces_output_budget(fuzz_target):
     if fuzz_target.zstd is None:
         pytest.skip("optional zstandard binding is unavailable")
     raw = b"Z" * (fuzz_target.MAX_STREAM_OUTPUT_BYTES + 1)
@@ -95,6 +95,26 @@ def test_zstd_native_stream_reader_enforces_output_budget(fuzz_target):
         )
     )
     assert (native_ok, exact_ok) == (False, False)
+
+
+def test_zstd_native_oracle_rejects_truncated_frame(fuzz_target):
+    if fuzz_target.zstd is None:
+        pytest.skip("optional zstandard binding is unavailable")
+    truncated = b"Q"
+
+    native_ok, _ = fuzz_target._accepted(
+        lambda: fuzz_target._native_zstd(truncated)
+    )
+    exact_ok, _ = fuzz_target._accepted(
+        lambda: fuzz_target.decode_exact(
+            truncated,
+            fuzz_target.Format.ZSTD,
+            limits=fuzz_target.FUZZ_LIMITS,
+        )
+    )
+
+    assert (native_ok, exact_ok) == (False, False)
+    fuzz_target._fuzz_stream(2, truncated)
 
 
 def test_zip_entry_and_aggregate_metadata_budgets(fuzz_target):
