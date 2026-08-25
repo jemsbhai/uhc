@@ -221,8 +221,11 @@ class PolynomialHash:
         """
         return self.hash_iter((data,))
 
-    def hash_iter(self, chunks: Iterable[bytes]) -> int:
-        """Compute the same polynomial hash over a one-pass byte source."""
+    def hash_iter(
+        self,
+        chunks: Iterable[bytes | bytearray | memoryview],
+    ) -> int:
+        """Compute the same hash over one-pass contiguous byte buffers."""
         p = self._p
         x = self._x
         value = 0
