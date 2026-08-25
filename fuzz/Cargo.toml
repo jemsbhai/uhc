@@ -1,0 +1,30 @@
+[package]
+name = "cdh-sort-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+cdh-sort = { path = ".." }
+hashrope = "0.2"
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "exact_sort"
+path = "fuzz_targets/exact_sort.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rope_builder"
+path = "fuzz_targets/rope_builder.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
