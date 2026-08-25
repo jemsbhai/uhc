@@ -1,0 +1,44 @@
+[package]
+name = "cdh-sort"
+version = "0.1.0"
+edition = "2021"
+description = "Experimental research prototype for compressed-domain sorting over LZ77 streams"
+license = "MIT"
+readme = "README.rust.md"
+repository = "https://github.com/jemsbhai/uhc"
+publish = false
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE",
+    "/README.rust.md",
+    "/src/**/*.rs",
+]
+build = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+name = "cdh_sort"
+path = "src/lib.rs"
+
+[dependencies]
+hashrope = "0.2"
+rand = "0.8"
+
+[dev-dependencies]
+# Retained for the preserved local benchmark scaffold. The scaffold itself is
+# not auto-discovered as a target and is excluded from crate packaging.
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
+debug = true
