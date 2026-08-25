@@ -1,49 +1,53 @@
-# Python
+# Rust build and local results
+/target/
+/results/
+
+# Python bytecode and packaging outputs
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 *.egg-info/
 *.egg
-dist/
-build/
-eggs/
+/dist/
+/build/
+/eggs/
 *.whl
 
-# Virtual environments
+# Python environments and tool caches
 venv/
 .venv/
 env/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Environment
-.env
-.env.local
-
-# Testing
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 htmlcov/
 .coverage
 .coverage.*
 coverage.xml
+.hypothesis/
 
-# OS
+# Local fuzzing outputs (checked-in seed corpora remain tracked)
+/fuzz/artifacts/
+/fuzz/coverage/
+/fuzz/target/
+.ipynb_checkpoints/
+
+# Editors and operating systems
+.vscode/
+.idea/
+*.swp
+*.swo
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# Secrets
+# Local configuration and secrets
 *.key
 *secrets*
 *.pem
+.env
+.env.local
 
-# Jupyter
-.ipynb_checkpoints/
-
-# Build artifacts
+# Logs
 *.log

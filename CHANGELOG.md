@@ -1,9 +1,104 @@
 # Changelog
 
+> **Release-containment notice:** Entries below are historical implementation
+> notes, not production-safety guarantees. Polynomial-hash equality is
+> probabilistic and is not collision-resistant authentication when parameters
+> are known. Exact verification and sorting do not establish authenticity,
+> provenance, or bounded-resource behavior; pre-existing `dist/` and
+> `uhc.egg-info/` artifacts are stale and must not be published.
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased] — UHC 06
+
+### Added
+- Cross-platform Python and Rust CI matrices with explicit optional-codec,
+  minimal-dependency, fuzz-target, lint, type, coverage, documentation, and
+  package-build jobs. No workflow publishes artifacts.
+- Wheel, source-distribution, and Rust crate content validation that rejects
+  cross-project research/build inputs and requires each package's core files.
+- Reproducible local quality-gate commands and tracked root/fuzz Cargo locks
+  for every CI command that uses `--locked`.
+
+### Changed
+- Python packaging uses SPDX license metadata and includes lint, type, build,
+  and metadata-check tools in the development extra.
+- Existing Python source and Rust source/test/doc quality backlogs were brought
+  under passing Ruff, Mypy, Rustfmt, Clippy, and rustdoc gates.
+
+## UHC 05
+
+### Added
+- Deterministic Hypothesis differentials against native zlib/gzip/Zstandard
+  decoders and Python `zipfile`, plus exact Rust proptest sorting/LCP checks.
+- Checked-in malformed and audit corpora with every known correctness repro,
+  exact replay commands, fixed seeds, and explicit optional-dependency skips.
+- Runnable Atheris native-differential and cargo-fuzz exact-sort/rope-builder
+  targets with checked-in seed corpora.
+
+### Fixed
+- Streaming exact Zstandard decoding now checks native per-frame EOF and rejects
+  truncated frames without materializing the full decoded stream.
+- Per-entry ZIP parsing now validates complete central/local boundaries,
+  metadata consistency, decoded size, and CRC before returning tokens.
+
+## UHC 04
+
+### Added
+- Iterator token APIs for DEFLATE, gzip, LZ4, and Zstandard, plus one-pass
+  tuple CDH and byte-chunk polynomial hashing.
+- Shared Python `ResourceLimits` for input, decoded output, token count, rope
+  depth, reference fields, and I/O chunk size; matching CLI options.
+- `cdc_ranges` for one-scan, zero-copy CDC boundary reporting.
+- Rust `BuildLimits` / `build_rope_with_limits`, bounded literal leaves, and
+  pre-reserved persistent arena-node growth.
+- Focused memory, node-count, one-pass, expansion-budget, and CLI regressions.
+
+### Changed
+- Exact raw-DEFLATE/gzip comparison and full-integrity BLAKE3 operate on bounded
+  decoded chunks. Raw CLI hashing streams file/stdin input.
+- Compatibility APIs that return `bytes`, token lists, or CDC chunk lists are
+  retained as explicit materializing wrappers.
+
+## UHC 03
+
+### Fixed
+- Multi-hash pipeline and CLI calls now honor the requested CDH method and
+  sliding-window parameters for every component.
+- CLI verification mismatches exit `1` in JSON as well as text/quiet modes;
+  malformed inputs and unsupported operations exit `2` without tracebacks.
+- ZIP is detected but explicitly rejected as an ambiguous whole-archive byte
+  stream across the API and CLI. Per-entry parsing remains available.
+- Python rope ranges and prime/base ownership are checked. Rust byte/range
+  access now has structured recoverable errors and checked helpers.
+
+### Added
+- `uhc_verify_exact`, the explicit name for authoritative decoded-byte
+  comparison; `uhc_verify` remains compatible.
+
+## UHC 02
+
+### Fixed
+- `uhc_verify` now strictly decodes through native format implementations,
+  applies a SHA-256 precheck, and compares decoded bytes exactly. The known
+  fixed-base collision no longer verifies equal.
+- Raw DEFLATE rejects trailing bytes; gzip validates headers, CRC/ISIZE, every
+  concatenated member, and trailing data; Zstandard iterates concatenated and
+  skippable frames and rejects truncation or trailing bytes.
+- LZ77 stream validation is centralized across decoding and CDH entry points.
+- Polynomial-hash construction rejects composite/non-Mersenne moduli, and
+  multi-hash construction rejects duplicate bases.
+- Rust LCP/comparison uses exact structural byte traversal. CD-Mergesort is no
+  longer vulnerable to polynomial-hash collisions.
+- Rust CD-Radix and DTH-Radix use explicit iterative work stacks rather than
+  recursive MSD calls that overflow on long shared prefixes.
+
+### Changed
+- Rust `build_rope` now returns `Result<Node, BuildError>` for malformed public
+  token streams. This is an intentional API break for recoverable failure.
 
 ## [0.1.5] - 2026-04-06
 

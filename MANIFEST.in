@@ -1,0 +1,31 @@
+include LICENSE
+include ADVERSARIAL_TESTING.md
+include README.python.md
+include pyproject.toml
+recursive-include uhc *.py
+recursive-include tests *.py
+recursive-include tests/corpus *.hex *.md
+
+# Keep the Python source distribution independent of the co-located Rust crate.
+prune src
+prune benches
+prune fuzz
+prune target
+prune dist
+
+# Keep adjacent or future research trees out of the Python release.
+prune experiments
+prune papers
+prune theory
+prune usecases
+
+exclude Cargo.toml
+exclude Cargo.lock
+exclude README.md
+exclude README.rust.md
+exclude PROJECT_BOUNDARIES.md
+exclude .coverage
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *.rs
+global-exclude *.so
