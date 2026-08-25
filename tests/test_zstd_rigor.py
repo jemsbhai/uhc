@@ -23,10 +23,16 @@ except ImportError:
     HAS_ZSTD = False
 
 from uhc.core.polynomial_hash import PolynomialHash
-from uhc.core.lz77 import Literal, Reference, lz77_decode
+from uhc.core.lz77 import Reference, lz77_decode
 from uhc.core.compressed_verifier import compressed_domain_hash, CDHMethod
 
-pytestmark = pytest.mark.skipif(not HAS_ZSTD, reason="zstandard not installed")
+pytestmark = pytest.mark.skipif(
+    not HAS_ZSTD,
+    reason=(
+        "Zstandard rigor tests require the optional 'zstandard' binding; "
+        "install with: python -m pip install -e '.[dev,formats]'"
+    ),
+)
 
 
 def zstd_compress(data: bytes, level: int = 3) -> bytes:

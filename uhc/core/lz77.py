@@ -14,7 +14,10 @@ for overlapping back-references (Definition 5).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Iterable, Iterator
 from typing import Sequence
+
+from uhc.core.resources import DEFAULT_LIMITS, ResourceLimitError, ResourceLimits
 
 
 # ---------------------------------------------------------------------------
@@ -34,8 +37,7 @@ class Literal:
     byte: int
 
     def __post_init__(self) -> None:
-        if not (0 <= self.byte <= 255):
-            raise ValueError(f"Literal byte must be in [0, 255], got {self.byte}")
+        _validate_literal(self.byte)
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,14 +56,156 @@ class Reference:
     length: int
 
     def __post_init__(self) -> None:
-        if self.distance < 1:
-            raise ValueError(f"Reference distance must be ≥ 1, got {self.distance}")
-        if self.length < 1:
-            raise ValueError(f"Reference length must be ≥ 1, got {self.length}")
+        _validate_reference(self.distance, self.length)
 
 
 # Type alias for a token
 Token = Literal | Reference
+
+
+def _validate_literal(byte: int) -> None:
+    """Validate one literal field at the single construction boundary."""
+    if type(byte) is not int or not (0 <= byte <= 255):
+        raise ValueError(f"Literal byte must be an integer in [0, 255], got {byte!r}")
+
+
+def _validate_reference(distance: int, length: int) -> None:
+    """Validate context-independent fields of one back-reference."""
+    if type(distance) is not int or distance < 1:
+        raise ValueError(f"Reference distance must be a positive integer, got {distance!r}")
+    if type(length) is not int or length < 1:
+        raise ValueError(f"Reference length must be a positive integer, got {length!r}")
+
+
+def validate_tokens(
+    tokens: Iterable[Token],
+    *,
+    max_distance: int | None = None,
+    max_length: int | None = None,
+) -> int:
+    """Validate an LZ77 stream and return its decoded length.
+
+    This is the authoritative stream-level validation boundary used by the
+    decoder and hash implementations. In addition to validating token fields,
+    it rejects references that reach before the beginning of the current
+    stream and optional format-limit violations.
+    """
+    position = 0
+    for index, token in enumerate(tokens):
+        if isinstance(token, Literal):
+            _validate_literal(token.byte)
+            position += 1
+            continue
+        if not isinstance(token, Reference):
+            raise TypeError(f"Token {index} has unsupported type {type(token).__name__}")
+
+        _validate_reference(token.distance, token.length)
+        if token.distance > position:
+            raise ValueError(
+                f"Invalid token {index}: reference distance {token.distance} "
+                f"exceeds decoded length {position}"
+            )
+        if max_distance is not None and token.distance > max_distance:
+            raise ValueError(
+                f"Invalid token {index}: reference distance {token.distance} "
+                f"exceeds format limit {max_distance}"
+            )
+        if max_length is not None and token.length > max_length:
+            raise ValueError(
+                f"Invalid token {index}: reference length {token.length} "
+                f"exceeds format limit {max_length}"
+            )
+        position += token.length
+    return position
+
+
+def iter_validated_tokens(
+    tokens: Iterable[Token],
+    *,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+    max_distance: int | None = None,
+    max_length: int | None = None,
+) -> Iterator[Token]:
+    """Validate and yield a token stream in one pass.
+
+    This is the consumption boundary used by streaming hash paths.  It avoids
+    converting iterators to lists and enforces token, decoded-output, and
+    reference budgets before yielding each token to downstream state.
+    """
+    position = 0
+    distance_limit = min(
+        limits.max_reference_distance,
+        max_distance if max_distance is not None else limits.max_reference_distance,
+    )
+    length_limit = min(
+        limits.max_reference_length,
+        max_length if max_length is not None else limits.max_reference_length,
+    )
+    for index, token in enumerate(tokens):
+        if index >= limits.max_tokens:
+            raise ResourceLimitError(
+                f"Token count exceeds max_tokens={limits.max_tokens}"
+            )
+        if isinstance(token, Literal):
+            _validate_literal(token.byte)
+            next_position = position + 1
+        elif isinstance(token, Reference):
+            _validate_reference(token.distance, token.length)
+            if token.distance > position:
+                raise ValueError(
+                    f"Invalid token {index}: reference distance {token.distance} "
+                    f"exceeds decoded length {position}"
+                )
+            if token.distance > distance_limit:
+                raise ResourceLimitError(
+                    f"Token {index} reference distance {token.distance} exceeds "
+                    f"limit {distance_limit}"
+                )
+            if token.length > length_limit:
+                raise ResourceLimitError(
+                    f"Token {index} reference length {token.length} exceeds "
+                    f"limit {length_limit}"
+                )
+            next_position = position + token.length
+        else:
+            raise TypeError(f"Token {index} has unsupported type {type(token).__name__}")
+
+        limits.check_output(next_position)
+        yield token
+        position = next_position
+
+
+def iter_lz77_decode(
+    tokens: Iterable[Token],
+    *,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> Iterator[bytes]:
+    """Decode tokens incrementally with a bounded back-reference window."""
+    window = bytearray()
+    pending = bytearray()
+    keep = limits.max_reference_distance
+
+    for token in iter_validated_tokens(tokens, limits=limits):
+        if isinstance(token, Literal):
+            pending.append(token.byte)
+            window.append(token.byte)
+        else:
+            for _ in range(token.length):
+                byte = window[-token.distance]
+                pending.append(byte)
+                window.append(byte)
+                if len(pending) >= limits.io_chunk_size:
+                    yield bytes(pending)
+                    pending.clear()
+
+        if len(window) > keep + limits.io_chunk_size:
+            del window[:-keep]
+        if len(pending) >= limits.io_chunk_size:
+            yield bytes(pending)
+            pending.clear()
+
+    if pending:
+        yield bytes(pending)
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +237,7 @@ def lz77_decode(tokens: Sequence[Token]) -> bytes:
     ValueError
         If a back-reference refers before the start of the buffer.
     """
+    validate_tokens(tokens)
     buf = bytearray()
 
     for tok in tokens:

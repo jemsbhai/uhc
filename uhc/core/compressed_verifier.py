@@ -25,7 +25,7 @@ All three must produce identical results for all inputs.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Sequence
+from collections.abc import Iterable
 
 from uhc.core.polynomial_hash import (
     PolynomialHash,
@@ -34,16 +34,16 @@ from uhc.core.polynomial_hash import (
     mersenne_mul,
     MERSENNE_61,
 )
-from uhc.core.lz77 import Token, Literal, Reference
+from uhc.core.lz77 import Token, Literal, Reference, iter_validated_tokens
+from uhc.core.resources import DEFAULT_LIMITS, ResourceLimitError, ResourceLimits
 from uhc.core.rope import (
     Leaf,
     rope_concat,
     rope_split,
     rope_repeat,
-    rope_substr_hash,
     rope_len,
     rope_hash,
-    rope_to_bytes,
+    rope_height,
     Node,
 )
 
@@ -61,13 +61,14 @@ class CDHMethod(str, Enum):
 
 
 def compressed_domain_hash(
-    tokens: Sequence[Token],
+    tokens: Iterable[Token],
     prime: int = MERSENNE_61,
     base: int = 131,
     method: str | CDHMethod = CDHMethod.ROPE,
     *,
     d_max: int = _DEFLATE_D_MAX,
     m_max: int = _DEFLATE_M_MAX,
+    limits: ResourceLimits = DEFAULT_LIMITS,
 ) -> int:
     """
     Compute the polynomial hash of the decoded data directly from
@@ -99,17 +100,29 @@ def compressed_domain_hash(
         H(decoded data), computed without full decompression.
     """
     method = CDHMethod(method)
+    state = make_cdh_state(method, prime, base, d_max, m_max, limits)
+    for tok in iter_validated_tokens(tokens, limits=limits):
+        state.process_token(tok)
+    return state.final_hash()
+
+
+def make_cdh_state(
+    method: str | CDHMethod,
+    prime: int,
+    base: int,
+    d_max: int,
+    m_max: int,
+    limits: ResourceLimits,
+):
+    """Create an incremental state for one CDH component."""
+    method = CDHMethod(method)
     if method == CDHMethod.PREFIX_ARRAY:
-        return _cdh_prefix_array(tokens, prime, base)
-    elif method == CDHMethod.ROPE:
-        return _cdh_rope(tokens, prime, base)
-    elif method == CDHMethod.SLIDING_ROPE:
-        state = SlidingRopeState(prime, base, d_max, m_max)
-        for tok in tokens:
-            state.process_token(tok)
-        return state.final_hash()
-    else:
-        raise ValueError(f"Unknown method: {method}")
+        return PrefixArrayState(prime, base)
+    if method == CDHMethod.ROPE:
+        return RopeHashState(prime, base, limits.max_depth)
+    if method == CDHMethod.SLIDING_ROPE:
+        return SlidingRopeState(prime, base, d_max, m_max, limits=limits)
+    raise ValueError(f"Unknown method: {method}")
 
 
 # ---------------------------------------------------------------------------
@@ -117,56 +130,79 @@ def compressed_domain_hash(
 # ---------------------------------------------------------------------------
 
 
+class PrefixArrayState:
+    """Incremental prefix-array CDH state for one hash component."""
+
+    __slots__ = ("h", "p", "base", "h_running", "prefix_hashes", "pos")
+
+    def __init__(self, prime: int, base: int) -> None:
+        self.h = PolynomialHash(prime=prime, base=base)
+        self.p = prime
+        self.base = base
+        self.h_running = 0
+        self.prefix_hashes: list[int] = [0]
+        self.pos = 0
+
+    def process_token(self, tok: Token) -> None:
+        if isinstance(tok, Literal):
+            self.h_running = mersenne_mod(
+                self.h_running * self.base + tok.byte + 1, self.p
+            )
+            self.pos += 1
+            self.prefix_hashes.append(self.h_running)
+            return
+
+        d, length = tok.distance, tok.length
+        start = self.pos - d
+        if d >= length:
+            copied_hash = _substr_hash_prefix(
+                self.prefix_hashes, start, length, self.h, self.p
+            )
+        else:
+            repetitions, remainder = divmod(length, d)
+            pattern_hash = _substr_hash_prefix(
+                self.prefix_hashes, start, d, self.h, self.p
+            )
+            prefix_hash = (
+                _substr_hash_prefix(
+                    self.prefix_hashes, start, remainder, self.h, self.p
+                )
+                if remainder
+                else 0
+            )
+            repeated_hash = mersenne_mul(
+                mersenne_mul(
+                    pattern_hash,
+                    phi(repetitions, self.h.power(d), self.p),
+                    self.p,
+                ),
+                self.h.power(remainder),
+                self.p,
+            )
+            copied_hash = mersenne_mod(repeated_hash + prefix_hash, self.p)
+
+        self.h_running = mersenne_mod(
+            self.h_running * self.h.power(length) + copied_hash, self.p
+        )
+        _fill_prefix_hashes(
+            self.prefix_hashes, self.pos, d, length, self.p, self.base
+        )
+        self.pos += length
+
+    def final_hash(self) -> int:
+        return self.h_running
+
+
 def _cdh_prefix_array(
-    tokens: Sequence[Token],
+    tokens: Iterable[Token],
     prime: int,
     base: int,
 ) -> int:
     """Original implementation using prefix hash array."""
-    h = PolynomialHash(prime=prime, base=base)
-    p = prime
-
-    h_running = 0
-    prefix_hashes: list[int] = [0]
-    pos = 0
-
-    for tok in tokens:
-        if isinstance(tok, Literal):
-            c = tok.byte
-            h_running = mersenne_mod(h_running * base + c + 1, p)
-            pos += 1
-            prefix_hashes.append(h_running)
-
-        elif isinstance(tok, Reference):
-            d, l = tok.distance, tok.length
-
-            if d >= l:
-                a = pos - d
-                h_source = _substr_hash_prefix(prefix_hashes, a, l, h, p)
-                x_l = h.power(l)
-                h_running = mersenne_mod(h_running * x_l + h_source, p)
-            else:
-                q, r = divmod(l, d)
-                a = pos - d
-                h_pattern = _substr_hash_prefix(prefix_hashes, a, d, h, p)
-                h_prefix = (
-                    _substr_hash_prefix(prefix_hashes, a, r, h, p) if r > 0 else 0
-                )
-                x_d = h.power(d)
-                x_r = h.power(r)
-                phi_val = phi(q, x_d, p)
-                h_w = mersenne_mod(
-                    mersenne_mul(mersenne_mul(h_pattern, phi_val, p), x_r, p)
-                    + h_prefix,
-                    p,
-                )
-                x_l = h.power(l)
-                h_running = mersenne_mod(h_running * x_l + h_w, p)
-
-            _fill_prefix_hashes(prefix_hashes, pos, d, l, p, base)
-            pos += l
-
-    return h_running
+    state = PrefixArrayState(prime, base)
+    for token in tokens:
+        state.process_token(token)
+    return state.final_hash()
 
 
 def _substr_hash_prefix(
@@ -212,8 +248,50 @@ def _fill_prefix_hashes(
 # ---------------------------------------------------------------------------
 
 
+class RopeHashState:
+    """Incremental persistent-rope CDH state with a depth budget."""
+
+    __slots__ = ("h", "rope", "max_depth")
+
+    def __init__(self, prime: int, base: int, max_depth: int) -> None:
+        self.h = PolynomialHash(prime=prime, base=base)
+        self.rope: Node = None
+        self.max_depth = max_depth
+
+    def process_token(self, tok: Token) -> None:
+        if isinstance(tok, Literal):
+            self.rope = rope_concat(
+                self.rope, Leaf(bytes([tok.byte]), self.h), self.h
+            )
+        else:
+            d, length = tok.distance, tok.length
+            start = rope_len(self.rope) - d
+            _, suffix = rope_split(self.rope, start, self.h)
+            if d >= length:
+                copied, _ = rope_split(suffix, length, self.h)
+                assert copied is not None
+            else:
+                pattern, _ = rope_split(suffix, d, self.h)
+                assert pattern is not None
+                repetitions, remainder = divmod(length, d)
+                copied = rope_repeat(pattern, repetitions, self.h)
+                if remainder:
+                    partial, _ = rope_split(pattern, remainder, self.h)
+                    copied = rope_concat(copied, partial, self.h)
+            self.rope = rope_concat(self.rope, copied, self.h)
+
+        depth = rope_height(self.rope)
+        if depth > self.max_depth:
+            raise ResourceLimitError(
+                f"Rope depth {depth} exceeds max_depth={self.max_depth}"
+            )
+
+    def final_hash(self) -> int:
+        return rope_hash(self.rope) if self.rope else 0
+
+
 def _cdh_rope(
-    tokens: Sequence[Token],
+    tokens: Iterable[Token],
     prime: int,
     base: int,
 ) -> int:
@@ -226,36 +304,10 @@ def _cdh_rope(
 
     Space: O(n · log N) for the rope (no prefix array, no decoded buffer).
     """
-    h = PolynomialHash(prime=prime, base=base)
-    rope: Node = None
-
-    for tok in tokens:
-        if isinstance(tok, Literal):
-            leaf = Leaf(bytes([tok.byte]), h)
-            rope = rope_concat(rope, leaf, h)
-
-        elif isinstance(tok, Reference):
-            d, l = tok.distance, tok.length
-            pos = rope_len(rope)
-
-            if d >= l:
-                start = pos - d
-                _, tmp = rope_split(rope, start, h)
-                source, _ = rope_split(tmp, l, h)
-                rope = rope_concat(rope, source, h)
-            else:
-                start = pos - d
-                _, tmp = rope_split(rope, start, h)
-                pattern, _ = rope_split(tmp, d, h)
-
-                q, r = divmod(l, d)
-                rep: Node = rope_repeat(pattern, q, h) if q >= 1 else None
-                if r > 0:
-                    partial, _ = rope_split(pattern, r, h)
-                    rep = rope_concat(rep, partial, h)
-                rope = rope_concat(rope, rep, h)
-
-    return rope_hash(rope) if rope else 0
+    state = RopeHashState(prime, base, DEFAULT_LIMITS.max_depth)
+    for token in tokens:
+        state.process_token(token)
+    return state.final_hash()
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +336,7 @@ class SlidingRopeState:
     """
 
     __slots__ = ("h", "d_max", "m_max", "W", "h_prefix", "l_prefix",
-                 "r_window", "pos")
+                 "r_window", "pos", "limits", "token_count")
 
     def __init__(
         self,
@@ -292,6 +344,8 @@ class SlidingRopeState:
         base: int = 131,
         d_max: int = _DEFLATE_D_MAX,
         m_max: int = _DEFLATE_M_MAX,
+        *,
+        limits: ResourceLimits = DEFAULT_LIMITS,
     ) -> None:
         if d_max < 1:
             raise ValueError(f"d_max must be ≥ 1, got {d_max}")
@@ -302,6 +356,8 @@ class SlidingRopeState:
         self.d_max = d_max
         self.m_max = m_max
         self.W = d_max + m_max
+        self.limits = limits
+        self.token_count = 0
 
         # State (Definition 10)
         self.h_prefix: int = 0      # H(T[0..l_prefix-1])
@@ -325,10 +381,34 @@ class SlidingRopeState:
 
     def process_token(self, tok: Token) -> None:
         """Process a single token, maintaining I_slide."""
+        if self.token_count >= self.limits.max_tokens:
+            raise ResourceLimitError(
+                f"Token count exceeds max_tokens={self.limits.max_tokens}"
+            )
         if isinstance(tok, Literal):
+            self.limits.check_output(self.pos + 1)
             self._process_literal(tok.byte)
         elif isinstance(tok, Reference):
+            if tok.distance > self.limits.max_reference_distance:
+                raise ResourceLimitError(
+                    f"Reference distance {tok.distance} exceeds "
+                    f"max_reference_distance={self.limits.max_reference_distance}"
+                )
+            if tok.length > self.limits.max_reference_length:
+                raise ResourceLimitError(
+                    f"Reference length {tok.length} exceeds "
+                    f"max_reference_length={self.limits.max_reference_length}"
+                )
+            self.limits.check_output(self.pos + tok.length)
             self._process_ref(tok.distance, tok.length)
+        else:
+            raise TypeError(f"Unsupported token type {type(tok).__name__}")
+        self.token_count += 1
+        depth = rope_height(self.r_window)
+        if depth > self.limits.max_depth:
+            raise ResourceLimitError(
+                f"Rope depth {depth} exceeds max_depth={self.limits.max_depth}"
+            )
 
     def _process_literal(self, c: int) -> None:
         """ProcessLiteral(c) — Theorem 11."""
@@ -369,6 +449,7 @@ class SlidingRopeState:
             # Overlapping: extract pattern of length d, repeat
             _, tmp = rope_split(self.r_window, start, self.h)
             pattern, _ = rope_split(tmp, d, self.h)
+            assert pattern is not None
 
             q, r = divmod(l, d)
             rep: Node = rope_repeat(pattern, q, self.h) if q >= 1 else None

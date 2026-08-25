@@ -22,15 +22,17 @@ from __future__ import annotations
 import gzip
 import io
 import itertools
+import os
+import sys
+import tempfile
 import zlib
 import zipfile
 import pytest
 
+from uhc.cli import main
 from uhc.core.polynomial_hash import PolynomialHash
 from uhc.core.compressed_verifier import compressed_domain_hash, CDHMethod
-from uhc.core.lz77 import Literal, lz77_decode
-from uhc.core.deflate import deflate_extract_tokens
-from uhc.core.gzip_parser import gzip_extract_tokens
+from uhc.core.lz77 import lz77_decode
 from uhc.core.zip_parser import zip_list_entries, zip_entry_extract_tokens
 from uhc.engine.pipeline import extract_tokens, Format
 from uhc.core.multihash import MultiHash, multi_cdh
@@ -52,6 +54,15 @@ try:
     HAS_ZSTD = True
 except ImportError:
     HAS_ZSTD = False
+
+LZ4_SKIP_REASON = (
+    "LZ4 matrix coverage requires the optional 'lz4' binding; "
+    "install with: python -m pip install -e '.[dev,formats]'"
+)
+ZSTD_SKIP_REASON = (
+    "Zstandard matrix coverage requires the optional 'zstandard' binding; "
+    "install with: python -m pip install -e '.[dev,formats]'"
+)
 
 
 # ===================================================================
@@ -97,6 +108,24 @@ if HAS_ZSTD:
     FORMATS.append(("zstd", _compress_zstd))
 
 FORMAT_NAMES = [name for name, _ in FORMATS]
+
+OPTIONAL_FORMAT_CASES = [
+    pytest.param(
+        "lz4_block",
+        _compress_lz4_block,
+        marks=pytest.mark.skipif(not HAS_LZ4, reason=LZ4_SKIP_REASON),
+    ),
+    pytest.param(
+        "lz4_frame",
+        _compress_lz4_frame,
+        marks=pytest.mark.skipif(not HAS_LZ4, reason=LZ4_SKIP_REASON),
+    ),
+    pytest.param(
+        "zstd",
+        _compress_zstd,
+        marks=pytest.mark.skipif(not HAS_ZSTD, reason=ZSTD_SKIP_REASON),
+    ),
+]
 
 
 # ===================================================================
@@ -172,6 +201,14 @@ class TestCrossFormatMatrix:
     every size, verify that compressed-domain hashing produces
     identical results regardless of compression format.
     """
+
+    @pytest.mark.parametrize("fmt_name,compress_fn", OPTIONAL_FORMAT_CASES)
+    def test_optional_format_coverage_is_explicit(self, fmt_name, compress_fn):
+        """Run every optional path or report its actionable skip reason."""
+        data = _data_text_like(4096)
+        compressed, fmt = compress_fn(data)
+        tokens = extract_tokens(compressed, fmt)
+        assert lz77_decode(tokens) == data, fmt_name
 
     @pytest.mark.parametrize("data_name,data_fn", DATA_GENERATORS,
                              ids=[d[0] for d in DATA_GENERATORS])
@@ -348,14 +385,6 @@ class TestCrossFormatZipEntries:
 # CLI cross-format verify
 # ===================================================================
 
-import io as _io
-import os
-import sys
-import tempfile
-
-from uhc.cli import main
-
-
 class CLIRunner:
     def __init__(self):
         self.exit_code = 0
@@ -363,7 +392,7 @@ class CLIRunner:
         self.stderr = ""
 
     def run(self, args):
-        out, err = _io.StringIO(), _io.StringIO()
+        out, err = io.StringIO(), io.StringIO()
         old_out, old_err = sys.stdout, sys.stderr
         try:
             sys.stdout, sys.stderr = out, err
@@ -423,7 +452,7 @@ class TestCLICrossFormatVerify:
             os.unlink(p_gz)
             os.unlink(p_def)
 
-    @pytest.mark.skipif(not HAS_ZSTD, reason="zstandard not installed")
+    @pytest.mark.skipif(not HAS_ZSTD, reason=ZSTD_SKIP_REASON)
     def test_cli_gzip_vs_zstd(self, cli, test_data):
         p_gz = _write_temp(gzip.compress(test_data))
         cctx = zstandard.ZstdCompressor()
@@ -437,7 +466,7 @@ class TestCLICrossFormatVerify:
             os.unlink(p_gz)
             os.unlink(p_zst)
 
-    @pytest.mark.skipif(not HAS_LZ4, reason="lz4 not installed")
+    @pytest.mark.skipif(not HAS_LZ4, reason=LZ4_SKIP_REASON)
     def test_cli_deflate_vs_lz4(self, cli, test_data):
         c = zlib.compressobj(6, zlib.DEFLATED, -15)
         p_def = _write_temp(c.compress(test_data) + c.flush())
@@ -451,7 +480,10 @@ class TestCLICrossFormatVerify:
             os.unlink(p_def)
             os.unlink(p_lz4)
 
-    @pytest.mark.skipif(not (HAS_LZ4 and HAS_ZSTD), reason="lz4+zstd needed")
+    @pytest.mark.skipif(
+        not (HAS_LZ4 and HAS_ZSTD),
+        reason=f"{LZ4_SKIP_REASON}; {ZSTD_SKIP_REASON}",
+    )
     def test_cli_lz4_vs_zstd(self, cli, test_data):
         p_lz4 = _write_temp(lz4.frame.compress(test_data))
         cctx = zstandard.ZstdCompressor()

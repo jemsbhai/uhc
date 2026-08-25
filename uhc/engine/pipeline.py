@@ -17,7 +17,8 @@ Usage:
     # One-shot hash of raw data (auto-chunks, auto-compresses)
     h = uhc_hash(data)
 
-    # Hash with multi-hash for stronger collision resistance
+    # Multiple polynomial hashes reduce accidental-collision probability;
+    # they do not provide adversarial collision resistance.
     h_k = uhc_hash(data, bases=[131, 257])
 
     # Hash pre-compressed data
@@ -27,17 +28,19 @@ Usage:
 from __future__ import annotations
 
 from enum import Enum
-from typing import Sequence
+from collections.abc import Iterator
 
 from uhc.core.polynomial_hash import PolynomialHash, MERSENNE_61
-from uhc.core.lz77 import Token
+from uhc.core.lz77 import Literal, Token, iter_validated_tokens
 from uhc.core.compressed_verifier import compressed_domain_hash, CDHMethod
-from uhc.core.deflate import deflate_extract_tokens
-from uhc.core.gzip_parser import gzip_extract_tokens
-from uhc.core.lz4_parser import lz4_extract_tokens, lz4_frame_extract_tokens
-from uhc.core.zstd_parser import zstd_extract_tokens
+from uhc.core.deflate import iter_deflate_tokens
+from uhc.core.gzip_parser import iter_gzip_tokens
+from uhc.core.lz4_parser import iter_lz4_tokens, iter_lz4_frame_tokens
+from uhc.core.zstd_parser import iter_zstd_tokens
 from uhc.core.multihash import MultiHash, multi_cdh
-from uhc.chunking.cdc import cdc_chunk
+from uhc.chunking.cdc import cdc_ranges
+from uhc.core.exact import compare_exact_decoded
+from uhc.core.resources import DEFAULT_LIMITS, ResourceLimits
 
 
 # ---------------------------------------------------------------------------
@@ -52,16 +55,30 @@ class Format(str, Enum):
     LZ4_BLOCK = "lz4_block"
     LZ4_FRAME = "lz4_frame"
     ZSTD = "zstd"
+    ZIP = "zip"
     RAW = "raw"  # uncompressed — will auto-compress with DEFLATE
+
+
+class UnsupportedFormatError(ValueError):
+    """A recognized format is intentionally unavailable for this operation."""
+
+
+def _reject_zip(fmt: Format, operation: str) -> None:
+    if fmt == Format.ZIP:
+        raise UnsupportedFormatError(
+            f"ZIP archives are multi-entry containers and cannot be {operation} "
+            "as one byte stream. Use uhc.core.zip_parser to select one stored "
+            "or DEFLATE entry explicitly."
+        )
 
 
 # Format → (token extractor, CDH d_max, CDH m_max)
 _FORMAT_CONFIG = {
-    Format.DEFLATE:   (deflate_extract_tokens, 32768, 258),
-    Format.GZIP:      (gzip_extract_tokens, 32768, 258),
-    Format.LZ4_BLOCK: (lz4_extract_tokens, 65535, 65536),
-    Format.LZ4_FRAME: (lz4_frame_extract_tokens, 65535, 65536),
-    Format.ZSTD:      (zstd_extract_tokens, 2**27, 131074),
+    Format.DEFLATE:   (iter_deflate_tokens, 32768, 258),
+    Format.GZIP:      (iter_gzip_tokens, 32768, 258),
+    Format.LZ4_BLOCK: (iter_lz4_tokens, 65535, 65536),
+    Format.LZ4_FRAME: (iter_lz4_frame_tokens, 65535, 65536),
+    Format.ZSTD:      (iter_zstd_tokens, 2**27, 131074),
 }
 
 
@@ -70,7 +87,12 @@ _FORMAT_CONFIG = {
 # ---------------------------------------------------------------------------
 
 
-def extract_tokens(data: bytes, fmt: Format) -> list[Token]:
+def extract_tokens(
+    data: bytes,
+    fmt: Format,
+    *,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> list[Token]:
     """
     Extract LZ77 tokens from compressed data.
 
@@ -86,12 +108,24 @@ def extract_tokens(data: bytes, fmt: Format) -> list[Token]:
     list[Token]
         Extracted LZ77 tokens.
     """
-    if fmt == Format.RAW:
-        from uhc.core.lz77 import Literal
-        return [Literal(b) for b in data]
+    return list(iter_tokens(data, fmt, limits=limits))
 
-    extractor = _FORMAT_CONFIG[fmt][0]
-    return extractor(data)
+
+def iter_tokens(
+    data: bytes,
+    fmt: Format,
+    *,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> Iterator[Token]:
+    """Yield validated format tokens with finite input/output/token budgets."""
+    limits.check_input(len(data))
+    _reject_zip(fmt, "processed")
+    source = (
+        (Literal(byte) for byte in data)
+        if fmt == Format.RAW
+        else _FORMAT_CONFIG[fmt][0](data)
+    )
+    return iter_validated_tokens(source, limits=limits)
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +144,7 @@ def uhc_hash(
     avg_chunk: int = 8192,
     max_chunk: int = 65536,
     cdh_method: CDHMethod = CDHMethod.ROPE,
+    limits: ResourceLimits = DEFAULT_LIMITS,
 ) -> int:
     """
     Compute the polynomial hash of data.
@@ -143,14 +178,18 @@ def uhc_hash(
         Polynomial hash H(data) in [0, p-1].
     """
     h = PolynomialHash(prime=prime, base=base)
+    limits.check_input(len(data))
+    if fmt == Format.RAW:
+        limits.check_output(len(data))
 
     if fmt != Format.RAW:
         # Pre-compressed: extract tokens, CDH directly
-        tokens = extract_tokens(data, fmt)
+        tokens = iter_tokens(data, fmt, limits=limits)
         d_max, m_max = _FORMAT_CONFIG[fmt][1], _FORMAT_CONFIG[fmt][2]
         return compressed_domain_hash(
             tokens, prime=prime, base=base, method=cdh_method,
             d_max=d_max, m_max=m_max,
+            limits=limits,
         )
 
     if not chunk or len(data) <= max_chunk:
@@ -158,11 +197,12 @@ def uhc_hash(
         return h.hash(data)
 
     # CDC chunk → hash each chunk → compose via Theorem 1
-    chunks = cdc_chunk(data, min_size=min_chunk, avg_size=avg_chunk,
-                       max_size=max_chunk)
     running = 0
-    for c in chunks:
-        running = h.hash_concat(running, len(c), h.hash(c))
+    for start, end in cdc_ranges(
+        data, min_size=min_chunk, avg_size=avg_chunk, max_size=max_chunk
+    ):
+        chunk_hash = h.hash_iter((memoryview(data)[start:end],))
+        running = h.hash_concat(running, end - start, chunk_hash)
     return running
 
 
@@ -173,6 +213,7 @@ def uhc_hash_compressed(
     prime: int = MERSENNE_61,
     base: int = 131,
     cdh_method: CDHMethod = CDHMethod.ROPE,
+    limits: ResourceLimits = DEFAULT_LIMITS,
 ) -> int:
     """
     Compute the polynomial hash of the decompressed content of data,
@@ -193,11 +234,15 @@ def uhc_hash_compressed(
     if fmt == Format.RAW:
         return PolynomialHash(prime=prime, base=base).hash(data)
 
-    tokens = extract_tokens(data, fmt)
+    limits.check_input(len(data))
+    if fmt == Format.RAW:
+        limits.check_output(len(data))
+    tokens = iter_tokens(data, fmt, limits=limits)
     d_max, m_max = _FORMAT_CONFIG[fmt][1], _FORMAT_CONFIG[fmt][2]
     return compressed_domain_hash(
         tokens, prime=prime, base=base, method=cdh_method,
         d_max=d_max, m_max=m_max,
+        limits=limits,
     )
 
 
@@ -213,12 +258,16 @@ def uhc_hash_multi(
     prime: int = MERSENNE_61,
     fmt: Format = Format.RAW,
     cdh_method: CDHMethod = CDHMethod.ROPE,
+    d_max: int | None = None,
+    m_max: int | None = None,
+    limits: ResourceLimits = DEFAULT_LIMITS,
 ) -> tuple[int, ...]:
     """
-    Compute k-tuple polynomial hash for stronger collision resistance.
+    Compute a k-tuple polynomial hash for probabilistic screening.
 
-    Default: k=2 with bases [131, 257], giving collision bound
-    < (N/p)^2 ≈ 2^(-82) for 1GB files with p = 2^61-1 (Corollary 5).
+    Multiple components can reduce accidental-collision probability under the
+    framework's random-base model. They do not make this a cryptographic hash;
+    known or fixed bases permit constructed adversarial collisions.
 
     Parameters
     ----------
@@ -229,7 +278,10 @@ def uhc_hash_multi(
     prime : int
         Mersenne prime.
     fmt : Format
-        Input format.
+        Input format. ZIP is recognized but intentionally rejected because an
+        archive has no single decoded byte stream.
+    cdh_method : CDHMethod
+        CDH back-end used for every component on compressed input.
 
     Returns
     -------
@@ -240,12 +292,33 @@ def uhc_hash_multi(
         bases = [131, 257]
 
     mh = MultiHash(bases=bases, prime=prime)
+    limits.check_input(len(data))
+    if fmt == Format.RAW:
+        limits.check_output(len(data))
 
     if fmt != Format.RAW:
-        tokens = extract_tokens(data, fmt)
-        return multi_cdh(tokens, mh)
+        tokens = iter_tokens(data, fmt, limits=limits)
+        default_d_max, default_m_max = _FORMAT_CONFIG[fmt][1:]
+        resolved_d_max = default_d_max if d_max is None else d_max
+        resolved_m_max = default_m_max if m_max is None else m_max
+        if limits == DEFAULT_LIMITS:
+            return multi_cdh(
+                tokens,
+                mh,
+                method=cdh_method,
+                d_max=resolved_d_max,
+                m_max=resolved_m_max,
+            )
+        return multi_cdh(
+            tokens,
+            mh,
+            method=cdh_method,
+            d_max=resolved_d_max,
+            m_max=resolved_m_max,
+            limits=limits,
+        )
 
-    return mh.hash(data)
+    return mh.hash_iter((data,))
 
 
 def uhc_hash_compressed_multi(
@@ -254,6 +327,10 @@ def uhc_hash_compressed_multi(
     *,
     bases: list[int] | None = None,
     prime: int = MERSENNE_61,
+    cdh_method: CDHMethod = CDHMethod.ROPE,
+    d_max: int | None = None,
+    m_max: int | None = None,
+    limits: ResourceLimits = DEFAULT_LIMITS,
 ) -> tuple[int, ...]:
     """
     Compute k-tuple hash of decompressed content without decompressing.
@@ -274,17 +351,78 @@ def uhc_hash_compressed_multi(
         bases = [131, 257]
 
     mh = MultiHash(bases=bases, prime=prime)
+    limits.check_input(len(data))
+    if fmt == Format.RAW:
+        limits.check_output(len(data))
 
     if fmt == Format.RAW:
-        return mh.hash(data)
+        return mh.hash_iter((data,))
 
-    tokens = extract_tokens(data, fmt)
-    return multi_cdh(tokens, mh)
+    tokens = iter_tokens(data, fmt, limits=limits)
+    default_d_max, default_m_max = _FORMAT_CONFIG[fmt][1:]
+    resolved_d_max = default_d_max if d_max is None else d_max
+    resolved_m_max = default_m_max if m_max is None else m_max
+    if limits == DEFAULT_LIMITS:
+        return multi_cdh(
+            tokens,
+            mh,
+            method=cdh_method,
+            d_max=resolved_d_max,
+            m_max=resolved_m_max,
+        )
+    return multi_cdh(
+        tokens,
+        mh,
+        method=cdh_method,
+        d_max=resolved_d_max,
+        m_max=resolved_m_max,
+        limits=limits,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Convenience: verify two datasets match
+# Exact decoded-byte verification
 # ---------------------------------------------------------------------------
+
+
+def uhc_verify_exact(
+    data_a: bytes,
+    data_b: bytes,
+    *,
+    bases: list[int] | None = None,
+    prime: int = MERSENNE_61,
+    fmt_a: Format = Format.RAW,
+    fmt_b: Format = Format.RAW,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> bool:
+    """
+    Strictly decode two datasets and compare their bytes exactly.
+
+    Native format decoders validate compressed syntax, checksums where the
+    format provides them, concatenated gzip/Zstandard streams, and complete
+    input consumption. SHA-256 provides a cryptographic precheck; a final
+    constant-time byte comparison makes the result exact even in the
+    hypothetical event of a digest collision.
+
+    ``bases`` and ``prime`` remain accepted for source compatibility with the
+    former probabilistic verifier. They are validated but do not participate
+    in the exact comparison.
+
+    Returns
+    -------
+    bool
+        True if and only if the decoded byte strings are equal.
+    """
+    if bases is None:
+        from uhc.core.polynomial_hash import validate_mersenne_prime
+
+        validate_mersenne_prime(prime)
+    else:
+        MultiHash(bases=bases, prime=prime)
+
+    return compare_exact_decoded(
+        data_a, fmt_a, data_b, fmt_b, limits=limits
+    )
 
 
 def uhc_verify(
@@ -295,18 +433,19 @@ def uhc_verify(
     prime: int = MERSENNE_61,
     fmt_a: Format = Format.RAW,
     fmt_b: Format = Format.RAW,
+    limits: ResourceLimits = DEFAULT_LIMITS,
 ) -> bool:
-    """
-    Verify that two datasets (possibly in different formats) represent
-    the same content.
+    """Compatibility name for :func:`uhc_verify_exact`.
 
-    Uses k-tuple multi-hash for collision resistance.
-
-    Returns
-    -------
-    bool
-        True if hash tuples match (content is identical with high probability).
+    Unlike the polynomial-hash APIs, this function performs authoritative
+    decoded-byte equality checking. It does not authenticate either input.
     """
-    h_a = uhc_hash_multi(data_a, bases=bases, prime=prime, fmt=fmt_a)
-    h_b = uhc_hash_multi(data_b, bases=bases, prime=prime, fmt=fmt_b)
-    return h_a == h_b
+    return uhc_verify_exact(
+        data_a,
+        data_b,
+        bases=bases,
+        prime=prime,
+        fmt_a=fmt_a,
+        fmt_b=fmt_b,
+        limits=limits,
+    )

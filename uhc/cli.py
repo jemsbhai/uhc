@@ -3,7 +3,7 @@ UHC command-line interface.
 
 Commands:
     uhc hash <file>              Hash a file (raw or compressed)
-    uhc verify <file_a> <file_b> Verify two files match across formats
+    uhc verify <file_a> <file_b> Strictly decode and compare bytes exactly
     uhc chunks <file>            Show CDC chunk boundaries and hashes
     uhc inspect <file>           Dump extracted LZ77 tokens
 
@@ -14,25 +14,28 @@ JSON output for automation, and tunable sliding window parameters.
 from __future__ import annotations
 
 import argparse
+import io
 import json
+import struct
 import sys
 import os
 import time
+from itertools import chain
+from collections.abc import Iterator
 
 from uhc.engine.pipeline import (
     Format,
-    uhc_hash,
-    uhc_hash_compressed,
-    uhc_hash_multi,
-    uhc_hash_compressed_multi,
-    uhc_verify,
+    UnsupportedFormatError,
+    uhc_verify_exact,
     extract_tokens,
+    iter_tokens,
 )
-from uhc.chunking.cdc import cdc_chunk
+from uhc.chunking.cdc import cdc_ranges
 from uhc.core.polynomial_hash import PolynomialHash, MERSENNE_61
 from uhc.core.compressed_verifier import compressed_domain_hash, CDHMethod
 from uhc.core.multihash import MultiHash, multi_cdh
 from uhc.core.lz77 import Literal, Reference, lz77_decode
+from uhc.core.resources import DEFAULT_LIMITS, ResourceLimits
 
 
 # ---------------------------------------------------------------------------
@@ -40,10 +43,15 @@ from uhc.core.lz77 import Literal, Reference, lz77_decode
 # ---------------------------------------------------------------------------
 
 _MAGIC_BYTES = {
+    b"PK\x03\x04":                      Format.ZIP,        # ZIP local header
+    b"PK\x05\x06":                      Format.ZIP,        # empty ZIP EOCD
+    b"PK\x07\x08":                      Format.ZIP,        # ZIP data descriptor
     b"\x1f\x8b":                         Format.GZIP,        # gzip (RFC 1952, wraps DEFLATE)
     b"\x04\x22\x4d\x18":                Format.LZ4_FRAME,  # LZ4 frame
     b"\x28\xb5\x2f\xfd":                Format.ZSTD,        # Zstandard (Lemma 11)
 }
+
+_FORMAT_CHOICES = [fmt.value for fmt in Format] + ["auto"]
 
 # DEFLATE raw streams have no magic — detected by exclusion or --format flag
 
@@ -92,7 +100,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="uhc",
         description="UHC — Unified Hash-Compression Engine. "
-                    "Compute integrity hashes of compressed data without decompression.",
+                    "Experimental polynomial-hash screening over compressed data; "
+                    "not authentication or proof of byte equality.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {_get_version()}")
 
@@ -102,7 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     def _add_common(p: argparse.ArgumentParser) -> None:
         p.add_argument(
             "--format", "-f", default=None,
-            choices=["raw", "deflate", "gzip", "lz4_block", "lz4_frame", "zstd", "auto"],
+            choices=_FORMAT_CHOICES,
             help="Input format (default: auto-detect, falls back to raw)",
         )
         p.add_argument(
@@ -116,9 +125,28 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Show elapsed time after command execution")
         p.add_argument("-v", "--verbose", action="store_true",
                        help="Show detailed output (format, method, token count)")
+        p.add_argument("--max-input-bytes", type=int,
+                       default=DEFAULT_LIMITS.max_input_bytes)
+        p.add_argument("--max-output-bytes", type=int,
+                       default=DEFAULT_LIMITS.max_output_bytes)
+        p.add_argument("--max-tokens", type=int, default=DEFAULT_LIMITS.max_tokens)
+        p.add_argument("--max-depth", type=int, default=DEFAULT_LIMITS.max_depth)
+        p.add_argument("--max-reference-distance", type=int,
+                       default=DEFAULT_LIMITS.max_reference_distance)
+        p.add_argument("--max-reference-length", type=int,
+                       default=DEFAULT_LIMITS.max_reference_length)
+        p.add_argument("--io-chunk-size", type=int,
+                       default=DEFAULT_LIMITS.io_chunk_size)
 
     # --- hash ---
-    p_hash = sub.add_parser("hash", help="Hash a file (raw or compressed)")
+    p_hash = sub.add_parser(
+        "hash",
+        help="Compute a probabilistic polynomial screening hash",
+        description=(
+            "Compute an experimental polynomial screening hash. Hash equality "
+            "is not proof of byte equality; use 'uhc verify' for exact comparison."
+        ),
+    )
     p_hash.add_argument("file", help="Path to file, or '-' for stdin")
     _add_common(p_hash)
     p_hash.add_argument(
@@ -143,18 +171,25 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"Mersenne prime (default: 2^61-1 = {MERSENNE_61})")
 
     # --- verify ---
-    p_verify = sub.add_parser("verify", help="Verify two files contain identical content")
+    p_verify = sub.add_parser(
+        "verify",
+        help="Strictly decode and compare file content bytes",
+        description=(
+            "Strictly decode both inputs with native format decoders, then "
+            "perform a cryptographic precheck and exact byte comparison."
+        ),
+    )
     p_verify.add_argument("file_a", help="First file, or '-' for stdin")
     p_verify.add_argument("file_b", help="Second file")
     _add_common(p_verify)
     p_verify.add_argument("--format-a", default=None,
-                          choices=["raw", "deflate", "gzip", "lz4_block", "lz4_frame", "zstd", "auto"],
+                          choices=_FORMAT_CHOICES,
                           help="Format of first file (overrides --format for file A)")
     p_verify.add_argument("--format-b", default=None,
-                          choices=["raw", "deflate", "gzip", "lz4_block", "lz4_frame", "zstd", "auto"],
+                          choices=_FORMAT_CHOICES,
                           help="Format of second file (overrides --format for file B)")
     p_verify.add_argument("--bases", nargs="+", type=int, default=None,
-                          help="Hash bases for multi-hash verification")
+                          help="Deprecated compatibility option; validated but not used")
 
     # --- chunks ---
     p_chunks = sub.add_parser("chunks", help="Show CDC chunk boundaries and hashes")
@@ -185,7 +220,7 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Number of timing trials (default: 3)")
     p_bench.add_argument("--base", type=int, default=131, help="Hash base")
     p_bench.add_argument("--prime", type=int, default=MERSENNE_61,
-                         help=f"Mersenne prime (default: 2^61-1)")
+                         help="Mersenne prime (default: 2^61-1)")
     p_bench.add_argument("--method", "-m", default="rope",
                          choices=["rope", "prefix_array", "sliding_rope"],
                          help="CDH algorithm (default: rope)")
@@ -207,15 +242,49 @@ def _get_version() -> str:
         return "unknown"
 
 
-def _read_input(path: str) -> bytes:
-    """Read from file or stdin ('-')."""
+def _limits_from_args(args: argparse.Namespace) -> ResourceLimits:
+    return ResourceLimits(
+        max_input_bytes=args.max_input_bytes,
+        max_output_bytes=args.max_output_bytes,
+        max_tokens=args.max_tokens,
+        max_depth=args.max_depth,
+        max_reference_distance=args.max_reference_distance,
+        max_reference_length=args.max_reference_length,
+        io_chunk_size=args.io_chunk_size,
+    )
+
+
+def _iter_input(
+    path: str, limits: ResourceLimits = DEFAULT_LIMITS
+) -> Iterator[bytes]:
+    """Yield file/stdin chunks and reject oversize input before buffering it."""
     if path == "-":
-        return sys.stdin.buffer.read()
-    if not os.path.isfile(path):
-        print(f"Error: file not found: {path}", file=sys.stderr)
-        sys.exit(1)
-    with open(path, "rb") as f:
-        return f.read()
+        stream = sys.stdin.buffer
+        close = False
+    else:
+        if not os.path.isfile(path):
+            print(f"Error: file not found: {path}", file=sys.stderr)
+            sys.exit(1)
+        stream = open(path, "rb")
+        close = True
+
+    total = 0
+    try:
+        while True:
+            chunk = stream.read(limits.io_chunk_size)
+            if not chunk:
+                break
+            total += len(chunk)
+            limits.check_input(total)
+            yield chunk
+    finally:
+        if close:
+            stream.close()
+
+
+def _read_input(path: str, limits: ResourceLimits = DEFAULT_LIMITS) -> bytes:
+    """Compatibility reader for parser paths that still require compressed bytes."""
+    return b"".join(_iter_input(path, limits))
 
 
 def _resolve_format(data: bytes, fmt_arg: str | None) -> Format:
@@ -240,8 +309,19 @@ def _format_hash(value: int, use_hex: bool) -> str:
 # ---------------------------------------------------------------------------
 
 def _cmd_hash(args: argparse.Namespace) -> None:
-    data = _read_input(args.file)
-    fmt = _resolve_format(data, args.format)
+    limits = _limits_from_args(args)
+    source = iter(_iter_input(args.file, limits))
+    first = next(source, b"")
+    fmt = _resolve_format(first, args.format)
+    data = None if fmt == Format.RAW else b"".join(chain((first,), source))
+
+    def raw_chunks() -> Iterator[bytes]:
+        total = 0
+        for chunk in chain((first,), source):
+            total += len(chunk)
+            limits.check_output(total)
+            yield chunk
+
     method = CDHMethod(args.method)
     use_hex = args.hex
 
@@ -256,15 +336,35 @@ def _cmd_hash(args: argparse.Namespace) -> None:
         # Multi-hash
         mh = MultiHash(bases=args.bases, prime=args.prime)
         if fmt == Format.RAW:
-            result_tuple = mh.hash(data)
+            result_tuple = mh.hash_iter(raw_chunks())
         else:
-            tokens = extract_tokens(data, fmt)
-            result_tuple = multi_cdh(tokens, mh)
+            assert data is not None
+            tokens = iter_tokens(data, fmt, limits=limits)
+            if limits == DEFAULT_LIMITS:
+                result_tuple = multi_cdh(
+                    tokens,
+                    mh,
+                    method=method,
+                    d_max=d_max,
+                    m_max=m_max,
+                )
+            else:
+                result_tuple = multi_cdh(
+                    tokens,
+                    mh,
+                    method=method,
+                    d_max=d_max,
+                    m_max=m_max,
+                    limits=limits,
+                )
 
         if args.output == "json":
             out = {"file": args.file, "format": fmt.value, "k": len(args.bases),
                    "bases": args.bases, "hashes": list(result_tuple),
-                   "hashes_hex": [format(v, "x") for v in result_tuple]}
+                   "hashes_hex": [format(v, "x") for v in result_tuple],
+                   "method": method.value,
+                   "operation": "probabilistic_polynomial_screening",
+                   "authoritative": False}
             print(json.dumps(out))
         elif args.quiet:
             print(", ".join(_format_hash(v, use_hex) for v in result_tuple))
@@ -274,18 +374,29 @@ def _cmd_hash(args: argparse.Namespace) -> None:
     else:
         # Single hash
         if fmt == Format.RAW:
-            result = PolynomialHash(prime=args.prime, base=args.base).hash(data)
+            result = PolynomialHash(prime=args.prime, base=args.base).hash_iter(raw_chunks())
         else:
-            tokens = extract_tokens(data, fmt)
+            assert data is not None
+            token_count = 0
+
+            def counted_tokens():
+                nonlocal token_count
+                for token in iter_tokens(data, fmt, limits=limits):
+                    token_count += 1
+                    yield token
+
             result = compressed_domain_hash(
-                tokens, prime=args.prime, base=args.base,
+                counted_tokens(), prime=args.prime, base=args.base,
                 method=method, d_max=d_max, m_max=m_max,
+                limits=limits,
             )
 
         if args.output == "json":
             out = {"file": args.file, "format": fmt.value,
                    "method": method.value, "base": args.base,
-                   "hash": result, "hash_hex": format(result, "x")}
+                   "hash": result, "hash_hex": format(result, "x"),
+                   "operation": "probabilistic_polynomial_screening",
+                   "authoritative": False}
             print(json.dumps(out))
         elif args.quiet:
             print(_format_hash(result, use_hex))
@@ -293,68 +404,78 @@ def _cmd_hash(args: argparse.Namespace) -> None:
             if args.verbose and fmt != Format.RAW:
                 print(f"Format:  {fmt.value}")
                 print(f"Method:  {method.value}")
-                print(f"Tokens:  {len(tokens)}")
+                print(f"Tokens:  {token_count}")
                 print(f"Hash:    {_format_hash(result, use_hex)}")
             else:
                 print(_format_hash(result, use_hex))
 
 
 def _cmd_verify(args: argparse.Namespace) -> None:
-    data_a = _read_input(args.file_a)
-    data_b = _read_input(args.file_b)
+    limits = _limits_from_args(args)
+    data_a = _read_input(args.file_a, limits)
+    data_b = _read_input(args.file_b, limits)
 
     fmt_a_arg = args.format_a if args.format_a else args.format
     fmt_b_arg = args.format_b if args.format_b else args.format
     fmt_a = _resolve_format(data_a, fmt_a_arg)
     fmt_b = _resolve_format(data_b, fmt_b_arg)
 
-    match = uhc_verify(
+    match = uhc_verify_exact(
         data_a, data_b,
         fmt_a=fmt_a, fmt_b=fmt_b,
         bases=args.bases,
+        limits=limits,
     )
 
     if args.output == "json":
         out = {"file_a": args.file_a, "file_b": args.file_b,
                "format_a": fmt_a.value, "format_b": fmt_b.value,
-               "match": match}
+               "match": match,
+               "comparison": "sha256_then_exact_bytes",
+               "authoritative": True,
+               "authentication": False}
         print(json.dumps(out))
+        if not match:
+            sys.exit(1)
     elif args.quiet:
         sys.exit(0 if match else 1)
     else:
         if match:
-            print("MATCH — files contain identical content")
+            print("BYTE MATCH — decoded contents are exactly equal")
         else:
-            print("MISMATCH — files differ")
+            print("BYTE MISMATCH — decoded contents differ")
             sys.exit(1)
 
 
 def _cmd_chunks(args: argparse.Namespace) -> None:
-    data = _read_input(args.file)
+    limits = _limits_from_args(args)
+    data = _read_input(args.file, limits)
+    fmt = _resolve_format(data, args.format)
+    if fmt == Format.ZIP:
+        raise UnsupportedFormatError(
+            "ZIP archives are multi-entry containers and cannot be chunked "
+            "as one decoded byte stream"
+        )
     h = PolynomialHash(base=131)
     use_hex = args.hex
 
-    chunks = cdc_chunk(
-        data,
-        min_size=args.min_size,
-        avg_size=args.avg_size,
+    ranges = list(cdc_ranges(
+        data, min_size=args.min_size, avg_size=args.avg_size,
         max_size=args.max_size,
-    )
+    ))
 
     if args.output == "json":
         chunk_list = []
-        offset = 0
-        for i, chunk in enumerate(chunks):
-            ch = h.hash(chunk)
+        for i, (start, end) in enumerate(ranges):
+            ch = h.hash_iter((memoryview(data)[start:end],))
             chunk_list.append({
-                "index": i, "offset": offset, "size": len(chunk),
+                "index": i, "offset": start, "size": end - start,
                 "hash": ch, "hash_hex": format(ch, "x"),
             })
-            offset += len(chunk)
 
-        avg = len(data) / len(chunks) if chunks else 0
+        avg = len(data) / len(ranges) if ranges else 0
         out = {"file": args.file, "total_bytes": len(data),
-               "num_chunks": len(chunks), "avg_chunk_size": round(avg, 1),
+               "num_chunks": len(ranges), "avg_chunk_size": round(avg, 1),
                "chunks": chunk_list}
         print(json.dumps(out))
     else:
@@ -362,26 +483,25 @@ def _cmd_chunks(args: argparse.Namespace) -> None:
             print(f"{'#':>4}  {'Offset':>10}  {'Size':>8}  {'Hash'}")
             print(f"{'—'*4}  {'—'*10}  {'—'*8}  {'—'*20}")
 
-        offset = 0
-        for i, chunk in enumerate(chunks):
-            ch = h.hash(chunk)
-            print(f"{i+1:>4}  {offset:>10}  {len(chunk):>8}  {_format_hash(ch, use_hex)}")
-            offset += len(chunk)
+        for i, (start, end) in enumerate(ranges):
+            ch = h.hash_iter((memoryview(data)[start:end],))
+            print(f"{i+1:>4}  {start:>10}  {end-start:>8}  {_format_hash(ch, use_hex)}")
 
         if not args.quiet:
-            avg = len(data) / len(chunks) if chunks else 0
-            print(f"\n{len(chunks)} chunks, {len(data)} bytes total, avg {avg:.0f} bytes/chunk")
+            avg = len(data) / len(ranges) if ranges else 0
+            print(f"\n{len(ranges)} chunks, {len(data)} bytes total, avg {avg:.0f} bytes/chunk")
 
 
 def _cmd_inspect(args: argparse.Namespace) -> None:
-    data = _read_input(args.file)
+    limits = _limits_from_args(args)
+    data = _read_input(args.file, limits)
     fmt = _resolve_format(data, args.format)
 
     if fmt == Format.RAW:
         print("Error: --format must specify a compression format for inspect", file=sys.stderr)
         sys.exit(1)
 
-    tokens = extract_tokens(data, fmt)
+    tokens = extract_tokens(data, fmt, limits=limits)
     limit = args.limit
 
     if args.output == "json":
@@ -423,7 +543,8 @@ def _cmd_inspect(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def _cmd_info(args: argparse.Namespace) -> None:
-    data = _read_input(args.file)
+    limits = _limits_from_args(args)
+    data = _read_input(args.file, limits)
     fmt = _resolve_format(data, args.format)
     file_size = len(data)
 
@@ -436,7 +557,7 @@ def _cmd_info(args: argparse.Namespace) -> None:
             print(f"Size:    {file_size} bytes")
             print(f"Format:  {fmt.value}")
     else:
-        tokens = extract_tokens(data, fmt)
+        tokens = extract_tokens(data, fmt, limits=limits)
         n_lit = sum(1 for t in tokens if isinstance(t, Literal))
         n_ref = sum(1 for t in tokens if isinstance(t, Reference))
         n_overlap = sum(
@@ -473,7 +594,8 @@ def _cmd_info(args: argparse.Namespace) -> None:
             print(f"  Overlapping:    {n_overlap}")
 
 def _cmd_benchmark(args: argparse.Namespace) -> None:
-    data = _read_input(args.file)
+    limits = _limits_from_args(args)
+    data = _read_input(args.file, limits)
     fmt = _resolve_format(data, args.format)
 
     if fmt == Format.RAW:
@@ -495,10 +617,11 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
     cdh_hash = None
     for _ in range(trials):
         t0 = time.perf_counter()
-        tokens = extract_tokens(data, fmt)
+        tokens = extract_tokens(data, fmt, limits=limits)
         cdh_hash = compressed_domain_hash(
             tokens, prime=args.prime, base=args.base,
             method=method, d_max=d_max, m_max=m_max,
+            limits=limits,
         )
         cdh_times.append(time.perf_counter() - t0)
 
@@ -507,7 +630,7 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
     dth_hash = None
     for _ in range(trials):
         t0 = time.perf_counter()
-        tokens = extract_tokens(data, fmt)
+        tokens = extract_tokens(data, fmt, limits=limits)
         decompressed = lz77_decode(tokens)
         dth_hash = h.hash(decompressed)
         dth_times.append(time.perf_counter() - t0)
@@ -527,6 +650,9 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
             "dth_time": round(dth_best, 6),
             "speedup": round(speedup, 2),
             "match": match,
+            "comparison": "cdh_vs_parser_reconstructed_polynomial_hash",
+            "authoritative": False,
+            "warning": "Agreement does not independently validate parser correctness.",
             "cdh_hash": cdh_hash,
             "dth_hash": dth_hash,
         }
@@ -538,8 +664,12 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
         print(f"CDH time:   {cdh_best*1000:.2f} ms (best of {trials})")
         print(f"DTH time:   {dth_best*1000:.2f} ms (best of {trials})")
         print(f"Speedup:    {speedup:.2f}x")
-        status = "MATCH (Theorem 12 holds)" if match else "MISMATCH — BUG!"
-        print(f"Correctness: {status}")
+        status = (
+            "HASH MATCH on parser-reconstructed bytes (non-authoritative)"
+            if match
+            else "HASH MISMATCH — implementation discrepancy"
+        )
+        print(f"Cross-check: {status}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -550,13 +680,15 @@ def main(argv: list[str] | None = None) -> None:
     t_start = time.perf_counter() if use_timing else None
 
     is_json = getattr(args, 'output', 'text') == 'json'
-    captured = None
+    captured: str | None = None
+    capture_stream: io.StringIO | None = None
+    old_stdout = sys.stdout
+    pending_exit: SystemExit | None = None
 
     if use_timing and is_json:
         # Capture stdout so we can inject elapsed_ms into JSON
-        import io
-        old_stdout = sys.stdout
-        sys.stdout = io.StringIO()
+        capture_stream = io.StringIO()
+        sys.stdout = capture_stream
 
     try:
         if args.command == "hash":
@@ -571,9 +703,20 @@ def main(argv: list[str] | None = None) -> None:
             _cmd_info(args)
         elif args.command == "benchmark":
             _cmd_benchmark(args)
+    except SystemExit as exc:
+        pending_exit = exc
+    except (ValueError, OSError, ImportError, EOFError, IndexError, struct.error) as exc:
+        if is_json:
+            print(
+                json.dumps({"error": str(exc), "command": args.command}),
+                file=sys.stderr,
+            )
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        pending_exit = SystemExit(2)
     finally:
-        if use_timing and is_json:
-            captured = sys.stdout.getvalue()
+        if capture_stream is not None:
+            captured = capture_stream.getvalue()
             sys.stdout = old_stdout
 
     if use_timing and t_start is not None:
@@ -588,6 +731,9 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"\nElapsed time: {elapsed_ms:.2f} ms")
         else:
             print(f"\nElapsed time: {elapsed_ms:.2f} ms")
+
+    if pending_exit is not None:
+        raise pending_exit
 
 
 if __name__ == "__main__":

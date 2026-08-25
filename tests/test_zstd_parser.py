@@ -26,7 +26,13 @@ from uhc.core.polynomial_hash import PolynomialHash
 from uhc.core.lz77 import Literal, Reference, lz77_decode
 from uhc.core.compressed_verifier import compressed_domain_hash, CDHMethod
 
-pytestmark = pytest.mark.skipif(not HAS_ZSTD, reason="zstandard not installed")
+pytestmark = pytest.mark.skipif(
+    not HAS_ZSTD,
+    reason=(
+        "Zstandard parser tests require the optional 'zstandard' binding; "
+        "install with: python -m pip install -e '.[dev,formats]'"
+    ),
+)
 
 
 # ===================================================================

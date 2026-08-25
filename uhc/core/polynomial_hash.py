@@ -10,12 +10,49 @@ using bit-shift reduction (Lemma 14) to avoid expensive division.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 MERSENNE_61: int = (1 << 61) - 1  # 2^61 - 1
-MERSENNE_127: int = (1 << 127) - 1  # 2^127 - 1 (recommended for high security, Corollary 5)
+MERSENNE_127: int = (1 << 127) - 1  # Large-prime research configuration; not cryptographic
+
+
+def _is_prime(value: int) -> bool:
+    """Deterministically test the small exponent used by a Mersenne modulus."""
+    if value < 2:
+        return False
+    if value % 2 == 0:
+        return value == 2
+    divisor = 3
+    while divisor * divisor <= value:
+        if value % divisor == 0:
+            return False
+        divisor += 2
+    return True
+
+
+def validate_mersenne_prime(prime: int) -> None:
+    """Reject values that are not genuine Mersenne primes.
+
+    For ``prime = 2**q - 1``, Lucas-Lehmer is a deterministic primality test.
+    Supported research parameters are therefore checked exactly rather than
+    merely checking their bit shape.
+    """
+    if type(prime) is not int or prime < 3 or (prime & (prime + 1)) != 0:
+        raise ValueError(f"Prime must be a Mersenne prime 2^q-1, got {prime!r}")
+    exponent = prime.bit_length()
+    if not _is_prime(exponent):
+        raise ValueError(f"Mersenne exponent must be prime, got q={exponent}")
+    if exponent == 2:
+        return
+    state = 4
+    for _ in range(exponent - 2):
+        state = (state * state - 2) % prime
+    if state != 0:
+        raise ValueError(f"Modulus 2^{exponent}-1 is composite")
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +173,9 @@ class PolynomialHash:
     __slots__ = ("_p", "_x", "_power_cache")
 
     def __init__(self, prime: int = MERSENNE_61, base: int = 131) -> None:
+        validate_mersenne_prime(prime)
+        if type(base) is not int:
+            raise ValueError(f"Base must be an integer in [2, p-1], got {base!r}")
         if base < 2 or base >= prime:
             raise ValueError(f"Base must be in [2, p-1], got {base}")
         self._p = prime
@@ -179,16 +219,17 @@ class PolynomialHash:
         int
             Hash value in [0, p-1].
         """
-        if len(data) == 0:
-            return 0
+        return self.hash_iter((data,))
 
+    def hash_iter(self, chunks: Iterable[bytes]) -> int:
+        """Compute the same polynomial hash over a one-pass byte source."""
         p = self._p
         x = self._x
-        h = 0
-        for byte in data:
-            # h = h · x + (byte + 1)
-            h = mersenne_mod(h * x + byte + 1, p)
-        return h
+        value = 0
+        for chunk in chunks:
+            for byte in memoryview(chunk).cast("B"):
+                value = mersenne_mod(value * x + byte + 1, p)
+        return value
 
     def hash_concat(self, h_a: int, len_b: int, h_b: int) -> int:
         """

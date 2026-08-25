@@ -1,23 +1,29 @@
 """
 Theorem 23: Composition with Cryptographic Hash (BLAKE3).
 
+EXPERIMENTAL CONTAINMENT NOTICE: CDH-only results are probabilistic and not
+adversarially collision-resistant. The BLAKE3 mode now obtains bytes from the
+strict native-decoder path and rejects disagreement with the experimental token
+parser. It verifies content integrity, not authenticity or provenance.
+
 Provides a dual-mode integrity scheme:
 
     (a) Fast path — CDH^(k) only.
         Cost: O(k · c_F · n). Collision bound: (N/p)^k.
-        Sufficient for non-adversarial integrity (bit rot, accidental corruption).
+        Intended only as experimental screening for accidental corruption.
 
     (b) Full path — CDH^(k) + BLAKE3(T).
         Cost: O(k · c_F · n) + O(N). Security: BLAKE3 collision resistance.
-        Required when hash bases are public or adversary controls input.
+        Adds a cryptographic digest of strictly decoded bytes and cross-checks
+        the experimental parser reconstruction.
 
     (c) Incremental update — two modes:
         - List mode: CDH via Corollary 1 composition, O(k) add, O(k·m) remove.
         - Rope mode: CDH via rope operations (Theorems 6-7), O(k·log m) add/remove.
         BLAKE3 recomputed from stored chunk data on removal.
 
-The CDH hash provides fast probabilistic screening; BLAKE3 provides
-cryptographic collision resistance for adversarial settings (Theorem 22).
+The CDH hash provides probabilistic screening. BLAKE3 is computed from the
+strict native-decoder path; parser/native disagreement is a hard error.
 
 Requires: blake3 package (pip install blake3).
 """
@@ -25,11 +31,16 @@ Requires: blake3 package (pip install blake3).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Sequence
 
-from uhc.core.lz77 import Token, Literal, Reference, lz77_decode
+from uhc.core.lz77 import Token
 from uhc.core.multihash import MultiHash, multi_cdh
 from uhc.core.polynomial_hash import PolynomialHash, MERSENNE_61
+from uhc.core.resources import DEFAULT_LIMITS, ResourceLimits
+
+if TYPE_CHECKING:
+    from uhc.engine.pipeline import Format
 
 
 # ---------------------------------------------------------------------------
@@ -109,16 +120,18 @@ def integrity_full(
     data: bytes,
     fmt: "Format",
     mh: MultiHash,
+    *,
+    limits: ResourceLimits = DEFAULT_LIMITS,
 ) -> IntegrityResult:
     """
     Full-path integrity: CDH^(k) + BLAKE3(T) (Theorem 23b).
 
-    Computes CDH from the compressed token stream (no decompression for
-    the hash), then separately decompresses and computes BLAKE3 for
-    cryptographic collision resistance.
+    Computes CDH from the compressed token stream, strictly decodes with the
+    native format implementation, and rejects any parser/native disagreement
+    before computing BLAKE3 over the trusted bytes.
 
     Cost: O(k · c_F · n) for CDH + O(N) for BLAKE3.
-    Security: collision resistance of BLAKE3 (Theorem 22).
+    BLAKE3 is a cryptographic digest of the native decoder's output.
 
     Parameters
     ----------
@@ -137,19 +150,90 @@ def integrity_full(
     blake3_mod = _import_blake3()
 
     # Import here to avoid circular dependency
-    from uhc.engine.pipeline import extract_tokens
+    from uhc.engine.pipeline import iter_tokens
 
     # Step 1: Extract tokens (shared between CDH and decompression)
-    tokens = extract_tokens(data, fmt)
+    tokens = iter_tokens(data, fmt, limits=limits)
 
     # Step 2: CDH^(k) — no decompression needed (Theorem 12)
-    cdh = multi_cdh(tokens, mh)
+    d_max, m_max = {
+        "deflate": (32768, 258),
+        "gzip": (32768, 258),
+        "lz4_block": (65535, 65536),
+        "lz4_frame": (65535, 65536),
+        "zstd": (2**27, 131074),
+    }.get(getattr(fmt, "value", fmt), (32768, 258))
+    cdh = multi_cdh(tokens, mh, d_max=d_max, m_max=m_max, limits=limits)
 
-    # Step 3: Decompress and compute BLAKE3(T)
-    decompressed = lz77_decode(tokens)
-    digest = blake3_mod.blake3(decompressed).digest()
+    # Step 3: Strict native decode and parser cross-check.
+    from uhc.core.exact import iter_decode_exact
+    from uhc.core.lz77 import iter_lz77_decode
+
+    native_chunks = iter_decode_exact(data, fmt, limits=limits)
+    token_chunks = iter_lz77_decode(
+        iter_tokens(data, fmt, limits=limits), limits=limits
+    )
+    hasher = blake3_mod.blake3()
+    if not _compare_streams_and_hash(native_chunks, token_chunks, hasher):
+        raise ValueError("Experimental token parser disagrees with native decoder")
+
+    # Step 4: Finalize BLAKE3 over incrementally decoded trusted bytes.
+    digest = hasher.digest()
 
     return IntegrityResult(cdh_hash=cdh, blake3_digest=digest, mode="full")
+
+
+def _compare_streams_and_hash(
+    trusted: Iterable[bytes],
+    reconstructed: Iterable[bytes],
+    hasher,
+) -> bool:
+    """Compare differently chunked streams exactly while hashing the trusted one."""
+    left = iter(trusted)
+    right = iter(reconstructed)
+    left_chunk = right_chunk = b""
+    left_offset = right_offset = 0
+    left_done = right_done = False
+    exact = True
+
+    while True:
+        if not left_done and left_offset == len(left_chunk):
+            try:
+                left_chunk = next(left)
+                hasher.update(left_chunk)
+                left_offset = 0
+            except StopIteration:
+                left_done = True
+        if not right_done and right_offset == len(right_chunk):
+            try:
+                right_chunk = next(right)
+                right_offset = 0
+            except StopIteration:
+                right_done = True
+
+        if left_done or right_done:
+            if left_done != right_done:
+                exact = False
+            if not left_done:
+                for chunk in left:
+                    hasher.update(chunk)
+            if not right_done:
+                for _ in right:
+                    pass
+            return exact
+
+        size = min(
+            len(left_chunk) - left_offset,
+            len(right_chunk) - right_offset,
+        )
+        if size == 0:
+            continue
+        if left_chunk[left_offset:left_offset + size] != right_chunk[
+            right_offset:right_offset + size
+        ]:
+            exact = False
+        left_offset += size
+        right_offset += size
 
 
 # ---------------------------------------------------------------------------

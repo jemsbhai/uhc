@@ -16,6 +16,8 @@ DEFLATE format parameters (Definition 8):
 
 from __future__ import annotations
 
+from collections.abc import Generator, Iterator
+
 from uhc.core.lz77 import Token, Literal, Reference
 
 
@@ -68,6 +70,11 @@ class _BitReader:
     def exhausted(self) -> bool:
         return self._pos >= self._len and self._bit == 0
 
+    @property
+    def bytes_consumed(self) -> int:
+        """Number of source bytes containing bits consumed so far."""
+        return self._pos + (1 if self._bit else 0)
+
 
 # ---------------------------------------------------------------------------
 # Huffman decoder
@@ -96,7 +103,7 @@ class _HuffmanTable:
         if max_bits == 0:
             self._min_len = 0
             self._max_len = 0
-            self._symbols_by_code = {}
+            self._symbols_by_code: dict[tuple[int, int], int] = {}
             return
 
         # Step 1: count codes per length
@@ -114,7 +121,7 @@ class _HuffmanTable:
 
         # Step 3: assign codes to symbols
         # Map: (length, code) -> symbol
-        self._symbols_by_code: dict[tuple[int, int], int] = {}
+        self._symbols_by_code = {}
         self._min_len = max_bits
         self._max_len = 0
 
@@ -173,6 +180,7 @@ def _get_fixed_tables() -> tuple[_HuffmanTable, _HuffmanTable]:
     if _FIXED_LIT_TABLE is None:
         _FIXED_LIT_TABLE = _HuffmanTable(_build_fixed_lit_lengths())
         _FIXED_DIST_TABLE = _HuffmanTable(_build_fixed_dist_lengths())
+    assert _FIXED_DIST_TABLE is not None
     return _FIXED_LIT_TABLE, _FIXED_DIST_TABLE
 
 
@@ -307,8 +315,41 @@ def deflate_extract_tokens(compressed: bytes) -> list[Token]:
     list[Token]
         Sequence of Literal and Reference tokens.
     """
-    reader = _BitReader(compressed)
+    return list(iter_deflate_tokens(compressed))
+
+
+def iter_deflate_tokens(compressed: bytes) -> Iterator[Token]:
+    """Yield tokens from one raw DEFLATE stream without retaining them."""
+    consumed = yield from _iter_deflate_tokens_with_consumed(compressed)
+    if consumed != len(compressed):
+        raise ValueError(
+            f"Trailing data after DEFLATE stream: {len(compressed) - consumed} byte(s)"
+        )
+
+
+def _deflate_extract_tokens_with_consumed(compressed: bytes) -> tuple[list[Token], int]:
+    """Extract one raw DEFLATE stream and report its exact byte boundary.
+
+    The final block may end part-way through its last byte; those remaining
+    padding bits belong to that byte. Any following bytes are left for an
+    enclosing format such as gzip to process.
+    """
+    iterator = _iter_deflate_tokens_with_consumed(compressed)
     tokens: list[Token] = []
+    while True:
+        try:
+            tokens.append(next(iterator))
+        except StopIteration as stop:
+            return tokens, stop.value
+
+
+def _iter_deflate_tokens_with_consumed(
+    compressed: bytes,
+) -> Generator[Token, None, int]:
+    """Yield one stream's tokens and return its consumed byte count."""
+    if not compressed:
+        raise ValueError("Empty DEFLATE stream")
+    reader = _BitReader(compressed)
 
     while True:
         bfinal = reader.read_bits(1)
@@ -316,25 +357,25 @@ def deflate_extract_tokens(compressed: bytes) -> list[Token]:
 
         if btype == 0:
             # Stored block (no compression)
-            _parse_stored_block(reader, tokens)
+            yield from _parse_stored_block(reader)
         elif btype == 1:
             # Fixed Huffman
             lit_table, dist_table = _get_fixed_tables()
-            _parse_compressed_block(reader, lit_table, dist_table, tokens)
+            yield from _parse_compressed_block(reader, lit_table, dist_table)
         elif btype == 2:
             # Dynamic Huffman
             lit_table, dist_table = _decode_dynamic_tables(reader)
-            _parse_compressed_block(reader, lit_table, dist_table, tokens)
+            yield from _parse_compressed_block(reader, lit_table, dist_table)
         else:
             raise ValueError(f"Invalid DEFLATE block type: {btype}")
 
         if bfinal:
             break
 
-    return tokens
+    return reader.bytes_consumed
 
 
-def _parse_stored_block(reader: _BitReader, tokens: list[Token]) -> None:
+def _parse_stored_block(reader: _BitReader) -> Iterator[Token]:
     """Parse a stored (uncompressed) DEFLATE block."""
     reader.align_to_byte()
     length = int.from_bytes(reader.read_bytes(2), "little")
@@ -344,22 +385,21 @@ def _parse_stored_block(reader: _BitReader, tokens: list[Token]) -> None:
 
     data = reader.read_bytes(length)
     for byte in data:
-        tokens.append(Literal(byte))
+        yield Literal(byte)
 
 
 def _parse_compressed_block(
     reader: _BitReader,
     lit_table: _HuffmanTable,
     dist_table: _HuffmanTable,
-    tokens: list[Token],
-) -> None:
+) -> Iterator[Token]:
     """Parse a Huffman-compressed DEFLATE block."""
     while True:
         symbol = lit_table.decode(reader)
 
         if symbol < 256:
             # Literal byte
-            tokens.append(Literal(symbol))
+            yield Literal(symbol)
         elif symbol == 256:
             # End of block
             break
@@ -370,4 +410,4 @@ def _parse_compressed_block(
             length = _decode_length(symbol, reader)
             dist_symbol = dist_table.decode(reader)
             distance = _decode_distance(dist_symbol, reader)
-            tokens.append(Reference(distance=distance, length=length))
+            yield Reference(distance=distance, length=length)

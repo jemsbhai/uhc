@@ -25,11 +25,11 @@ ZIP structure used:
 
 from __future__ import annotations
 
+import binascii
 import struct
 from dataclasses import dataclass
-from typing import Sequence
 
-from uhc.core.lz77 import Token, Literal
+from uhc.core.lz77 import Token, Literal, lz77_decode
 from uhc.core.deflate import deflate_extract_tokens
 
 
@@ -101,7 +101,10 @@ def _find_eocd(data: bytes) -> int:
 
     for i in range(min_eocd_size, search_limit + 1):
         offset = len(data) - i
-        if data[offset:offset + 4] == _SIG_EOCD:
+        if data[offset:offset + 4] != _SIG_EOCD:
+            continue
+        comment_len = struct.unpack_from("<H", data, offset + 20)[0]
+        if offset + min_eocd_size + comment_len == len(data):
             return offset
 
     raise ValueError("Not a ZIP archive: End of Central Directory record not found")
@@ -120,20 +123,44 @@ def _parse_eocd(data: bytes, eocd_offset: int) -> tuple[int, int, int]:
     # Offset 12: central directory size (4 bytes)
     # Offset 16: offset of central directory (4 bytes)
 
+    disk_number = struct.unpack_from("<H", data, eocd_offset + 4)[0]
+    central_disk = struct.unpack_from("<H", data, eocd_offset + 6)[0]
+    disk_entries = struct.unpack_from("<H", data, eocd_offset + 8)[0]
     num_entries = struct.unpack_from("<H", data, eocd_offset + 10)[0]
     cd_size = struct.unpack_from("<I", data, eocd_offset + 12)[0]
     cd_offset = struct.unpack_from("<I", data, eocd_offset + 16)[0]
+
+    if disk_number != 0 or central_disk != 0 or disk_entries != num_entries:
+        raise ValueError("Multi-disk ZIP archives are not supported")
 
     # Check for ZIP64
     if num_entries == 0xFFFF or cd_offset == 0xFFFFFFFF or cd_size == 0xFFFFFFFF:
         # Look for ZIP64 EOCD locator (20 bytes before standard EOCD)
         loc_offset = eocd_offset - 20
-        if loc_offset >= 0 and data[loc_offset:loc_offset + 4] == _SIG_EOCD64_LOC:
-            eocd64_offset = struct.unpack_from("<Q", data, loc_offset + 8)[0]
-            if data[eocd64_offset:eocd64_offset + 4] == _SIG_EOCD64:
-                num_entries = struct.unpack_from("<Q", data, eocd64_offset + 32)[0]
-                cd_size = struct.unpack_from("<Q", data, eocd64_offset + 40)[0]
-                cd_offset = struct.unpack_from("<Q", data, eocd64_offset + 48)[0]
+        if loc_offset < 0 or data[loc_offset:loc_offset + 4] != _SIG_EOCD64_LOC:
+            raise ValueError("ZIP64 archive is missing its EOCD locator")
+        if loc_offset + 20 > len(data):
+            raise ValueError("Truncated ZIP64 EOCD locator")
+        eocd64_offset = struct.unpack_from("<Q", data, loc_offset + 8)[0]
+        if eocd64_offset + 56 > len(data):
+            raise ValueError("Truncated ZIP64 EOCD record")
+        if data[eocd64_offset:eocd64_offset + 4] != _SIG_EOCD64:
+            raise ValueError("Invalid ZIP64 EOCD signature")
+        zip64_disk = struct.unpack_from("<I", data, eocd64_offset + 16)[0]
+        zip64_central_disk = struct.unpack_from("<I", data, eocd64_offset + 20)[0]
+        zip64_disk_entries = struct.unpack_from("<Q", data, eocd64_offset + 24)[0]
+        num_entries = struct.unpack_from("<Q", data, eocd64_offset + 32)[0]
+        if zip64_disk != 0 or zip64_central_disk != 0 or zip64_disk_entries != num_entries:
+            raise ValueError("Multi-disk ZIP64 archives are not supported")
+        cd_size = struct.unpack_from("<Q", data, eocd64_offset + 40)[0]
+        cd_offset = struct.unpack_from("<Q", data, eocd64_offset + 48)[0]
+
+    if cd_offset > eocd_offset or cd_size > eocd_offset - cd_offset:
+        raise ValueError("ZIP central directory lies outside the archive")
+    if num_entries > cd_size // 46:
+        raise ValueError(
+            "ZIP entry count cannot fit in the declared central directory"
+        )
 
     return num_entries, cd_size, cd_offset
 
@@ -143,7 +170,7 @@ def _parse_eocd(data: bytes, eocd_offset: int) -> tuple[int, int, int]:
 # ---------------------------------------------------------------------------
 
 def _parse_central_directory(
-    data: bytes, cd_offset: int, num_entries: int
+    data: bytes, cd_offset: int, cd_size: int, num_entries: int
 ) -> list[ZipEntry]:
     """
     Parse the central directory to extract entry metadata.
@@ -154,12 +181,17 @@ def _parse_central_directory(
     """
     entries: list[ZipEntry] = []
     pos = cd_offset
+    cd_end = cd_offset + cd_size
 
-    for _ in range(num_entries):
-        if pos + 46 > len(data):
-            break
+    for entry_index in range(num_entries):
+        if pos + 46 > cd_end or pos + 46 > len(data):
+            raise ValueError(
+                f"Truncated ZIP central directory at entry {entry_index}"
+            )
         if data[pos:pos + 4] != _SIG_CENTRAL:
-            break
+            raise ValueError(
+                f"Invalid central directory signature at entry {entry_index}"
+            )
 
         # Central directory file header (46 bytes fixed)
         method = struct.unpack_from("<H", data, pos + 10)[0]
@@ -170,6 +202,11 @@ def _parse_central_directory(
         extra_len = struct.unpack_from("<H", data, pos + 30)[0]
         comment_len = struct.unpack_from("<H", data, pos + 32)[0]
         local_offset = struct.unpack_from("<I", data, pos + 42)[0]
+        next_pos = pos + 46 + fname_len + extra_len + comment_len
+        if next_pos > cd_end or next_pos > len(data):
+            raise ValueError(
+                f"Truncated variable fields in central directory entry {entry_index}"
+            )
 
         # Filename
         fname_bytes = data[pos + 46: pos + 46 + fname_len]
@@ -196,8 +233,38 @@ def _parse_central_directory(
             pos += 46 + fname_len + extra_len + comment_len
             continue
 
-        # Read local file header to find actual data offset
+        # Read and cross-check the local header before trusting its data offset.
+        if local_offset + 30 > len(data):
+            raise ValueError(
+                f"Truncated local file header for entry {filename!r}"
+            )
+        local_flags = struct.unpack_from("<H", data, local_offset + 6)[0]
+        local_method = struct.unpack_from("<H", data, local_offset + 8)[0]
+        local_fname_len = struct.unpack_from("<H", data, local_offset + 26)[0]
+        local_extra_len = struct.unpack_from("<H", data, local_offset + 28)[0]
+        local_name_start = local_offset + 30
+        local_name_end = local_name_start + local_fname_len
+        if local_name_end + local_extra_len > len(data):
+            raise ValueError(
+                f"Truncated local file header fields for entry {filename!r}"
+            )
+        if local_method != method or local_flags != gp_flags:
+            raise ValueError(
+                f"Local/central header mismatch for entry {filename!r}"
+            )
+        if data[local_name_start:local_name_end] != fname_bytes:
+            raise ValueError(
+                f"Local/central filename mismatch for entry {filename!r}"
+            )
         data_start = _local_header_data_offset(data, local_offset)
+        if data_start + comp_size > cd_offset:
+            raise ValueError(
+                f"Compressed data for entry {filename!r} overlaps the central directory"
+            )
+        if method == 0 and comp_size != uncomp_size:
+            raise ValueError(
+                f"Stored entry {filename!r} has inconsistent compressed and decoded sizes"
+            )
 
         entries.append(ZipEntry(
             filename=filename,
@@ -209,7 +276,13 @@ def _parse_central_directory(
             data_offset=data_start,
         ))
 
-        pos += 46 + fname_len + extra_len + comment_len
+        pos = next_pos
+
+    if pos != cd_end:
+        raise ValueError(
+            f"ZIP central directory size mismatch: parsed {pos - cd_offset} byte(s), "
+            f"expected {cd_size}"
+        )
 
     return entries
 
@@ -294,7 +367,7 @@ def zip_list_entries(data: bytes) -> list[ZipEntry]:
     """
     eocd_offset = _find_eocd(data)
     num_entries, cd_size, cd_offset = _parse_eocd(data, eocd_offset)
-    return _parse_central_directory(data, cd_offset, num_entries)
+    return _parse_central_directory(data, cd_offset, cd_size, num_entries)
 
 
 def zip_entry_extract_tokens(
@@ -328,10 +401,12 @@ def zip_entry_extract_tokens(
     ValueError
         If compression method is not supported (only 0 and 8).
     """
-    if entry.uncompressed_size == 0:
-        return []
-
     # Check for encryption
+    if entry.local_header_offset < 0 or entry.local_header_offset + 30 > len(data):
+        raise ValueError(f"Invalid local header offset for entry {entry.filename!r}")
+    expected_data_offset = _local_header_data_offset(data, entry.local_header_offset)
+    if expected_data_offset != entry.data_offset:
+        raise ValueError(f"Invalid data offset for entry {entry.filename!r}")
     gp_flags = struct.unpack_from("<H", data, entry.local_header_offset + 6)[0]
     if gp_flags & 0x0001:
         raise ValueError(
@@ -355,15 +430,18 @@ def zip_entry_extract_tokens(
         )
 
     # Extract the compressed data slice
-    comp_data = data[entry.data_offset: entry.data_offset + entry.compressed_size]
+    data_end = entry.data_offset + entry.compressed_size
+    if entry.data_offset < 0 or data_end > len(data):
+        raise ValueError(f"Truncated compressed data for entry {entry.filename!r}")
+    comp_data = data[entry.data_offset:data_end]
 
     if entry.compression_method == 0:
         # Stored: raw bytes → Literal tokens
-        return [Literal(b) for b in comp_data]
+        tokens: list[Token] = [Literal(b) for b in comp_data]
 
     elif entry.compression_method == 8:
         # DEFLATE: delegate to our RFC 1951 parser (Lemma 9)
-        return deflate_extract_tokens(comp_data)
+        tokens = deflate_extract_tokens(comp_data)
 
     else:
         raise ValueError(
@@ -371,3 +449,17 @@ def zip_entry_extract_tokens(
             f"for entry '{entry.filename}'. Only stored (0) and DEFLATE (8) "
             f"are supported."
         )
+
+    decoded = lz77_decode(tokens)
+    if len(decoded) != entry.uncompressed_size:
+        raise ValueError(
+            f"Decoded size mismatch for entry {entry.filename!r}: "
+            f"expected {entry.uncompressed_size}, got {len(decoded)}"
+        )
+    actual_crc = binascii.crc32(decoded) & 0xFFFFFFFF
+    if actual_crc != entry.crc32:
+        raise ValueError(
+            f"CRC mismatch for entry {entry.filename!r}: "
+            f"expected 0x{entry.crc32:08x}, got 0x{actual_crc:08x}"
+        )
+    return tokens

@@ -26,7 +26,7 @@ Implementation covers:
 from __future__ import annotations
 
 import struct
-from typing import Optional
+from collections.abc import Generator, Iterator
 
 from uhc.core.lz77 import Token, Literal, Reference
 
@@ -255,7 +255,7 @@ def _build_fse_table(distribution: list[int], accuracy_log: int) -> list[_FSEEnt
         elif p > 0:
             symbol_next[s] = p
 
-    table = [None] * table_size
+    table: list[_FSEEntry | None] = [None] * table_size
     for i in range(table_size):
         s = table_symbol[i]
         x = symbol_next[s]
@@ -264,7 +264,9 @@ def _build_fse_table(distribution: list[int], accuracy_log: int) -> list[_FSEEnt
         new_state = (x << nb) - table_size
         table[i] = _FSEEntry(s, nb, new_state)
 
-    return table
+    if any(entry is None for entry in table):
+        raise ValueError("Incomplete FSE decoding table")
+    return [entry for entry in table if entry is not None]
 
 
 def _decode_fse_distribution(reader: _ForwardBitReader,
@@ -545,6 +547,8 @@ def _huf_decode_stream(data: bytes, num_symbols: int,
 # ===================================================================
 
 def _parse_frame_header(data: bytes, pos: int):
+    if pos < 0 or pos + 5 > len(data):
+        raise ValueError("Truncated Zstandard frame header")
     magic = struct.unpack_from("<I", data, pos)[0]
     if magic != ZSTD_MAGIC:
         raise ValueError(f"Bad magic: 0x{magic:08X}")
@@ -552,6 +556,8 @@ def _parse_frame_header(data: bytes, pos: int):
 
     fhd = data[pos]
     pos += 1
+    if fhd & 0x08:
+        raise ValueError("Invalid Zstandard frame header: reserved bit is set")
 
     fcs_flag = (fhd >> 6) & 3
     single_segment = (fhd >> 5) & 1
@@ -561,6 +567,8 @@ def _parse_frame_header(data: bytes, pos: int):
     if single_segment:
         window_size = None
     else:
+        if pos >= len(data):
+            raise ValueError("Truncated Zstandard window descriptor")
         wd = data[pos]
         pos += 1
         exponent = (wd >> 3) & 0x1F
@@ -571,6 +579,8 @@ def _parse_frame_header(data: bytes, pos: int):
         window_size = window_base + window_add
 
     did_size = [0, 1, 2, 4][dict_id_flag]
+    if pos + did_size > len(data):
+        raise ValueError("Truncated Zstandard dictionary ID")
     pos += did_size
 
     if fcs_flag == 0:
@@ -579,6 +589,8 @@ def _parse_frame_header(data: bytes, pos: int):
         fcs_field_size = [0, 2, 4, 8][fcs_flag]
 
     fcs = None
+    if pos + fcs_field_size > len(data):
+        raise ValueError("Truncated Zstandard frame content size")
     if fcs_field_size == 1:
         fcs = data[pos]
     elif fcs_field_size == 2:
@@ -705,7 +717,7 @@ def _decode_sequences(data: bytes, pos: int, block_end: int,
                       prev_ll, prev_of, prev_ml,
                       repeat_offsets: list[int]):
     if pos >= block_end:
-        tokens = [Literal(b) for b in literals]
+        tokens: list[Token] = [Literal(b) for b in literals]
         return tokens, pos, prev_ll, prev_of, prev_ml, repeat_offsets
 
     byte0 = data[pos]
@@ -837,6 +849,115 @@ def _decode_sequences(data: bytes, pos: int, block_end: int,
 # Public API
 # ===================================================================
 
+def _zstd_extract_one_frame(data: bytes, start: int) -> tuple[list[Token], int]:
+    """Extract one standard frame beginning at ``start`` and return its end."""
+    iterator = _iter_zstd_one_frame(data, start)
+    tokens: list[Token] = []
+    while True:
+        try:
+            tokens.append(next(iterator))
+        except StopIteration as stop:
+            return tokens, stop.value
+
+
+def _iter_zstd_one_frame(data: bytes, start: int) -> Generator[Token, None, int]:
+    """Yield one frame's tokens and return its exact ending offset."""
+    if len(data) - start < 5:
+        raise ValueError("Truncated Zstandard frame header")
+
+    pos, window_size, fcs, has_checksum = _parse_frame_header(data, start)
+
+    decoded_size = 0
+    repeat_offsets = [1, 4, 8]
+    prev_huf = None
+    prev_ll = None
+    prev_of = None
+    prev_ml = None
+
+    while True:
+        if pos + 3 > len(data):
+            raise ValueError("Truncated Zstandard block header")
+
+        bh = data[pos] | (data[pos + 1] << 8) | (data[pos + 2] << 16)
+        pos += 3
+
+        last_block = bh & 1
+        block_type = (bh >> 1) & 3
+        block_size = bh >> 3
+
+        if block_type == 0:  # Raw
+            if pos + block_size > len(data):
+                raise ValueError("Truncated Zstandard raw block")
+            for byte in data[pos:pos + block_size]:
+                yield Literal(byte)
+                decoded_size += 1
+            pos += block_size
+
+        elif block_type == 1:  # RLE
+            if pos >= len(data):
+                raise ValueError("Truncated Zstandard RLE block")
+            rle_byte = data[pos]
+            pos += 1
+            for _ in range(block_size):
+                yield Literal(rle_byte)
+                decoded_size += 1
+
+        elif block_type == 2:  # Compressed
+            block_end = pos + block_size
+            if block_end > len(data):
+                raise ValueError("Truncated Zstandard compressed block")
+
+            lits, lit_end, prev_huf = _decode_literals(data, pos, prev_huf)
+            if lit_end > block_end:
+                raise ValueError("Zstandard literals section exceeds block boundary")
+
+            tokens, _, ll_info, of_info, ml_info, repeat_offsets = \
+                _decode_sequences(
+                    data, lit_end, block_end, lits,
+                    prev_ll, prev_of, prev_ml,
+                    repeat_offsets,
+                )
+
+            prev_ll = ll_info
+            prev_of = of_info
+            prev_ml = ml_info
+
+            for token in tokens:
+                if isinstance(token, Reference):
+                    if token.distance > decoded_size:
+                        raise ValueError(
+                            f"Zstandard reference distance {token.distance} exceeds "
+                            f"frame position {decoded_size}"
+                        )
+                    if window_size and token.distance > window_size:
+                        raise ValueError(
+                            f"Zstandard reference distance {token.distance} exceeds "
+                            f"frame window {window_size}"
+                        )
+                    decoded_size += token.length
+                else:
+                    decoded_size += 1
+                yield token
+            pos = block_end
+
+        else:
+            raise ValueError("Reserved Zstandard block type")
+
+        if last_block:
+            break
+
+    if has_checksum:
+        if pos + 4 > len(data):
+            raise ValueError("Truncated Zstandard content checksum")
+        pos += 4
+
+    if fcs is not None and decoded_size != fcs:
+        raise ValueError(
+            f"Zstandard frame content size mismatch: expected {fcs}, got {decoded_size}"
+        )
+    return pos
+
+
 def zstd_extract_tokens(data: bytes) -> list[Token]:
     """
     Parse a Zstandard frame and extract LZ77 tokens.
@@ -854,67 +975,34 @@ def zstd_extract_tokens(data: bytes) -> list[Token]:
         Sequence of Literal and Reference tokens whose lz77_decode
         equals the original uncompressed data.
     """
-    if len(data) < 4:
-        return []
+    return list(iter_zstd_tokens(data))
 
-    magic = struct.unpack_from("<I", data, 0)[0]
-    if 0x184D2A50 <= magic <= 0x184D2A5F:
-        return []
 
-    pos, window_size, fcs, has_checksum = _parse_frame_header(data, 0)
+def iter_zstd_tokens(data: bytes) -> Iterator[Token]:
+    """Yield tokens frame by frame, retaining at most one compressed block."""
+    if not data:
+        raise ValueError("Empty Zstandard input")
 
-    all_tokens: list[Token] = []
-    repeat_offsets = [1, 4, 8]
-    prev_huf = None
-    prev_ll = None
-    prev_of = None
-    prev_ml = None
+    pos = 0
+    frame_count = 0
+    while pos < len(data):
+        if len(data) - pos < 4:
+            raise ValueError(f"Trailing data after Zstandard frame at byte {pos}")
+        magic = struct.unpack_from("<I", data, pos)[0]
+        if 0x184D2A50 <= magic <= 0x184D2A5F:
+            if pos + 8 > len(data):
+                raise ValueError("Truncated Zstandard skippable-frame header")
+            skip_size = struct.unpack_from("<I", data, pos + 4)[0]
+            frame_end = pos + 8 + skip_size
+            if frame_end > len(data):
+                raise ValueError("Truncated Zstandard skippable frame")
+            pos = frame_end
+            continue
+        if magic != ZSTD_MAGIC:
+            raise ValueError(
+                f"Trailing data after Zstandard frame {frame_count}: "
+                f"bad magic 0x{magic:08X} at byte {pos}"
+            )
 
-    while True:
-        if pos + 3 > len(data):
-            break
-
-        bh = data[pos] | (data[pos + 1] << 8) | (data[pos + 2] << 16)
-        pos += 3
-
-        last_block = bh & 1
-        block_type = (bh >> 1) & 3
-        block_size = bh >> 3
-
-        if block_type == 0:  # Raw
-            for b in data[pos: pos + block_size]:
-                all_tokens.append(Literal(b))
-            pos += block_size
-
-        elif block_type == 1:  # RLE
-            rle_byte = data[pos]
-            pos += 1
-            for _ in range(block_size):
-                all_tokens.append(Literal(rle_byte))
-
-        elif block_type == 2:  # Compressed
-            block_end = pos + block_size
-
-            lits, lit_end, prev_huf = _decode_literals(data, pos, prev_huf)
-
-            tokens, _, ll_info, of_info, ml_info, repeat_offsets = \
-                _decode_sequences(
-                    data, lit_end, block_end, lits,
-                    prev_ll, prev_of, prev_ml,
-                    repeat_offsets
-                )
-
-            prev_ll = ll_info
-            prev_of = of_info
-            prev_ml = ml_info
-
-            all_tokens.extend(tokens)
-            pos = block_end
-
-        elif block_type == 3:
-            raise ValueError("Reserved block type")
-
-        if last_block:
-            break
-
-    return all_tokens
+        pos = yield from _iter_zstd_one_frame(data, pos)
+        frame_count += 1

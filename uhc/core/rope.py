@@ -30,7 +30,6 @@ from uhc.core.polynomial_hash import (
     phi,
     mersenne_mod,
     mersenne_mul,
-    MERSENNE_61,
 )
 
 # ---------------------------------------------------------------------------
@@ -64,6 +63,9 @@ class Leaf:
     hash_val: int
     len: int
     weight: int
+    height: int
+    prime: int
+    base: int
 
     def __init__(self, data: bytes, h: PolynomialHash) -> None:
         if len(data) == 0:
@@ -72,6 +74,9 @@ class Leaf:
         object.__setattr__(self, "len", len(data))
         object.__setattr__(self, "hash_val", h.hash(data))
         object.__setattr__(self, "weight", 1)
+        object.__setattr__(self, "height", 1)
+        object.__setattr__(self, "prime", h.prime)
+        object.__setattr__(self, "base", h.base)
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +94,9 @@ class Internal:
     hash_val: int
     len: int
     weight: int
+    height: int
+    prime: int
+    base: int
 
     def __init__(
         self,
@@ -96,13 +104,18 @@ class Internal:
         right: Leaf | Internal | RepeatNode,
         h: PolynomialHash,
     ) -> None:
+        _ensure_hasher(left, h)
+        _ensure_hasher(right, h)
         object.__setattr__(self, "left", left)
         object.__setattr__(self, "right", right)
         object.__setattr__(self, "len", left.len + right.len)
         object.__setattr__(self, "weight", left.weight + right.weight)
+        object.__setattr__(self, "height", 1 + max(left.height, right.height))
         # I3: hash = left.hash · x^(right.len) + right.hash
         hv = h.hash_concat(left.hash_val, right.len, right.hash_val)
         object.__setattr__(self, "hash_val", hv)
+        object.__setattr__(self, "prime", h.prime)
+        object.__setattr__(self, "base", h.base)
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +133,9 @@ class RepeatNode:
     hash_val: int
     len: int
     weight: int
+    height: int
+    prime: int
+    base: int
 
     def __init__(
         self,
@@ -129,15 +145,19 @@ class RepeatNode:
     ) -> None:
         if reps < 2:
             raise ValueError(f"RepeatNode reps must be >= 2, got {reps}")
+        _ensure_hasher(child, h)
         object.__setattr__(self, "child", child)
         object.__setattr__(self, "reps", reps)
         object.__setattr__(self, "len", child.len * reps)
         object.__setattr__(self, "weight", child.weight * reps)
+        object.__setattr__(self, "height", child.height + 1)
         # I6: hash = child.hash · Φ(reps, x^d)
         x_d = h.power(child.len)
         phi_val = phi(reps, x_d, h.prime)
         hv = mersenne_mul(child.hash_val, phi_val, h.prime)
         object.__setattr__(self, "hash_val", hv)
+        object.__setattr__(self, "prime", h.prime)
+        object.__setattr__(self, "base", h.base)
 
 
 # ---------------------------------------------------------------------------
@@ -155,20 +175,30 @@ def rope_hash(node: Node) -> int:
     return 0 if node is None else node.hash_val
 
 
+def rope_height(node: Node) -> int:
+    """Return structural height for public depth-budget enforcement."""
+    return _height(node)
+
+
+def _ensure_hasher(node: Node, h: PolynomialHash) -> None:
+    """Reject operations that mix ropes and polynomial-hash parameters."""
+    if node is None:
+        return
+    if node.prime != h.prime or node.base != h.base:
+        raise ValueError(
+            "Rope hasher mismatch: node uses "
+            f"prime={node.prime}, base={node.base}; operation uses "
+            f"prime={h.prime}, base={h.base}"
+        )
+
+
 def _weight(node: Node) -> int:
     return 0 if node is None else node.weight
 
 
 def _height(node: Node) -> int:
     """Approximate height for join decisions."""
-    if node is None:
-        return 0
-    if isinstance(node, Leaf):
-        return 1
-    if isinstance(node, RepeatNode):
-        return _height(node.child) + 1
-    # Internal
-    return 1 + max(_height(node.left), _height(node.right))
+    return 0 if node is None else node.height
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +288,8 @@ def rope_concat(
     Returns a valid hash rope representing left's string ‖ right's string.
     Time: O(k · |h_L - h_R|).
     """
+    _ensure_hasher(left, h)
+    _ensure_hasher(right, h)
     if left is None:
         return right
     if right is None:
@@ -285,6 +317,7 @@ def _join(
             # Split the repeat node in half, join right half with right
             mid = left.len // 2
             ll, lr = rope_split(left, mid, h)
+            assert ll is not None and lr is not None
             new_right = _join(lr, right, h)
             return _join(ll, new_right, h)
         else:
@@ -298,6 +331,7 @@ def _join(
         elif isinstance(right, RepeatNode):
             mid = right.len // 2
             rl, rr = rope_split(right, mid, h)
+            assert rl is not None and rr is not None
             new_left = _join(left, rl, h)
             return _join(new_left, rr, h)
         else:
@@ -318,6 +352,10 @@ def rope_split(
     Returns (left, right) where left has pos bytes, right has the rest.
     Time: O(k · log w).
     """
+    _ensure_hasher(node, h)
+    total = rope_len(node)
+    if pos < 0 or pos > total:
+        raise IndexError(f"Rope split position {pos} outside [0, {total}]")
     if node is None:
         return None, None
     if pos <= 0:
@@ -414,6 +452,9 @@ def rope_repeat(
 
     Time: O(k · log q) for the Φ computation. O(1) new nodes.
     """
+    _ensure_hasher(node, h)
+    if q < 0:
+        raise ValueError(f"Rope repetition count must be non-negative, got {q}")
     if q == 0:
         return None
     if q == 1:
@@ -437,6 +478,16 @@ def rope_substr_hash(
 
     Time: O(k · log w). Space: O(log w) stack.
     """
+    _ensure_hasher(node, h)
+    if start < 0 or length < 0:
+        raise ValueError(
+            "Rope range start and length must be non-negative, got "
+            f"start={start}, length={length}"
+        )
+    total = rope_len(node)
+    end = start + length
+    if start > total or end > total:
+        raise IndexError(f"Rope range [{start}, {end}) outside [0, {total})")
     if node is None or length == 0:
         return 0
     return _hash_range(node, start, length, h)
@@ -564,9 +615,16 @@ def validate_rope(node: Node, h: PolynomialHash | None = None) -> None:
     if node is None:
         return
 
+    if h is not None:
+        assert node.prime == h.prime and node.base == h.base, (
+            "Rope hasher metadata mismatch"
+        )
+
     if isinstance(node, Leaf):
         assert node.weight == 1, f"Leaf weight must be 1, got {node.weight}"
         assert node.len == len(node.data), "Leaf len mismatch"
+        if h is not None:
+            assert node.hash_val == h.hash(node.data), "Leaf hash mismatch"
         return
 
     if isinstance(node, Internal):
@@ -574,6 +632,11 @@ def validate_rope(node: Node, h: PolynomialHash | None = None) -> None:
         assert node.len == node.left.len + node.right.len, "Internal len mismatch"
         # I4
         assert node.weight == node.left.weight + node.right.weight, "Internal weight mismatch"
+        if h is not None:
+            expected = h.hash_concat(
+                node.left.hash_val, node.right.len, node.right.hash_val
+            )
+            assert node.hash_val == expected, "Internal hash mismatch"
         # I8: balance
         total = node.weight
         wl = node.left.weight
@@ -595,6 +658,9 @@ def validate_rope(node: Node, h: PolynomialHash | None = None) -> None:
         # I7
         assert node.weight == node.child.weight * node.reps, "RepeatNode weight mismatch"
         assert node.reps >= 2, f"RepeatNode reps must be >= 2, got {node.reps}"
+        if h is not None:
+            expected = h.hash_repeat(node.child.hash_val, node.child.len, node.reps)
+            assert node.hash_val == expected, "RepeatNode hash mismatch"
         validate_rope(node.child, h)
         return
 

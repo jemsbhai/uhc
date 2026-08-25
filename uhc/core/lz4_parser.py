@@ -24,6 +24,7 @@ LZ4 frame format:
 from __future__ import annotations
 
 import struct
+from collections.abc import Iterator
 
 from uhc.core.lz77 import Token, Literal, Reference
 
@@ -54,12 +55,16 @@ def lz4_extract_tokens(compressed: bytes) -> list[Token]:
     list[Token]
         Sequence of Literal and Reference tokens.
     """
-    tokens: list[Token] = []
+    return list(iter_lz4_tokens(compressed))
+
+
+def iter_lz4_tokens(compressed: bytes) -> Iterator[Token]:
+    """Yield raw LZ4-block tokens without retaining the full token stream."""
     pos = 0
     n = len(compressed)
 
     if n == 0:
-        return tokens
+        return
 
     while pos < n:
         # 1. Read token byte
@@ -86,7 +91,7 @@ def lz4_extract_tokens(compressed: bytes) -> list[Token]:
                     f"at position {pos}"
                 )
             for i in range(lit_len):
-                tokens.append(Literal(compressed[pos + i]))
+                yield Literal(compressed[pos + i])
             pos += lit_len
 
         # 4. Check if this is the last sequence (no match follows)
@@ -112,9 +117,7 @@ def lz4_extract_tokens(compressed: bytes) -> list[Token]:
                 if extra != 255:
                     break
 
-        tokens.append(Reference(distance=offset, length=match_len))
-
-    return tokens
+        yield Reference(distance=offset, length=match_len)
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +144,11 @@ def lz4_frame_extract_tokens(data: bytes) -> list[Token]:
     list[Token]
         Sequence of Literal and Reference tokens from all blocks.
     """
+    return list(iter_lz4_frame_tokens(data))
+
+
+def iter_lz4_frame_tokens(data: bytes) -> Iterator[Token]:
+    """Yield LZ4-frame tokens block by block."""
     if len(data) < 7:
         raise ValueError("LZ4 frame too short")
 
@@ -155,17 +163,17 @@ def lz4_frame_extract_tokens(data: bytes) -> list[Token]:
     # Frame descriptor
     flg = data[pos]
     pos += 1
-    bd = data[pos]
+    _bd = data[pos]
     pos += 1
 
     version = (flg >> 6) & 0x03
     if version != 1:
         raise ValueError(f"Unsupported LZ4 frame version: {version}")
 
-    b_indep = (flg >> 5) & 1       # Block independence flag
+    _b_indep = (flg >> 5) & 1      # Block independence flag
     b_checksum = (flg >> 4) & 1    # Block checksum flag
     c_size_flag = (flg >> 3) & 1   # Content size flag
-    c_checksum = (flg >> 2) & 1    # Content checksum flag
+    _c_checksum = (flg >> 2) & 1   # Content checksum flag
     # dict_id_flag = (flg >> 0) & 1  # Dictionary ID flag (not supported)
 
     # Optional content size (8 bytes)
@@ -181,8 +189,6 @@ def lz4_frame_extract_tokens(data: bytes) -> list[Token]:
     pos += 1
 
     # Parse blocks
-    tokens: list[Token] = []
-
     while pos + 4 <= len(data):
         block_size_raw = struct.unpack_from("<I", data, pos)[0]
         pos += 4
@@ -206,10 +212,10 @@ def lz4_frame_extract_tokens(data: bytes) -> list[Token]:
         if is_uncompressed:
             # Uncompressed block — all literals
             for byte in block_data:
-                tokens.append(Literal(byte))
+                yield Literal(byte)
         else:
             # Compressed block — parse as LZ4 block
-            tokens.extend(lz4_extract_tokens(block_data))
+            yield from iter_lz4_tokens(block_data)
 
         # Optional block checksum
         if b_checksum:
@@ -217,5 +223,3 @@ def lz4_frame_extract_tokens(data: bytes) -> list[Token]:
 
     # Optional content checksum at the end
     # (just skip — we don't verify checksums, only extract tokens)
-
-    return tokens

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import struct
 import hashlib
+from collections.abc import Iterator
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +103,18 @@ def cdc_chunk(
     ValueError
         If size parameters are invalid.
     """
+    return [data[start:end] for start, end in cdc_ranges(
+        data, min_size=min_size, avg_size=avg_size, max_size=max_size
+    )]
+
+
+def cdc_ranges(
+    data: bytes,
+    min_size: int = 2048,
+    avg_size: int = 8192,
+    max_size: int = 65536,
+) -> Iterator[tuple[int, int]]:
+    """Yield half-open CDC byte ranges in one scan without copying chunks."""
     if min_size < 1:
         raise ValueError(f"min_size must be >= 1, got {min_size}")
     if max_size < min_size:
@@ -113,12 +126,9 @@ def cdc_chunk(
 
     n = len(data)
     if n == 0:
-        return []
+        return
 
-    chunks: list[bytes] = []
     mask_bits = _avg_to_bits(avg_size)
-    mask = _mask_for_bits(mask_bits)
-
     # FastCDC uses a two-level mask: a harder mask (fewer bits) before
     # the average point and an easier mask (more bits) after, to normalize
     # the chunk size distribution. We use:
@@ -133,7 +143,7 @@ def cdc_chunk(
         chunk_end = min(chunk_start + max_size, n)
         # If remaining data fits in one chunk, take it all
         if chunk_end - chunk_start <= min_size:
-            chunks.append(data[chunk_start:chunk_end])
+            yield chunk_start, chunk_end
             break
 
         fp = 0
@@ -156,7 +166,5 @@ def cdc_chunk(
                     boundary = i + 1
                     break
 
-        chunks.append(data[chunk_start:boundary])
+        yield chunk_start, boundary
         chunk_start = boundary
-
-    return chunks
