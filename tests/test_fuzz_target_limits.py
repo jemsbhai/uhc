@@ -128,3 +128,15 @@ def test_zip_entry_and_aggregate_metadata_budgets(fuzz_target):
     assert len(aggregate) < fuzz_target.MAX_FUZZ_INPUT_BYTES
     with pytest.raises(ValueError, match="aggregate size"):
         fuzz_target._check_zip_metadata(fuzz_target.zip_list_entries(aggregate))
+
+
+def test_zip_reserved_deflate_distance_is_a_clean_rejection(fuzz_target):
+    archive = bytes.fromhex(
+        "504b0304140000000800000021004193e9700f0000001e00000009000000"
+        "61756469742e7478744b2c4dc91cd12f4e4d4d49c4c20600"
+        "504b01021400140000000800000021004193e9700f0000001e00000009000000"
+        "000000000000000080010000000061756469742e747874"
+        "504b0506000000000100010037000000360000000000"
+    )
+
+    fuzz_target._fuzz_zip(archive)

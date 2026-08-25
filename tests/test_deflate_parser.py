@@ -149,6 +149,25 @@ class TestDeflateTokenExtraction:
                 assert 3 <= tok.length <= 258, f"Length {tok.length} out of DEFLATE range"
                 assert 1 <= tok.distance <= 32768, f"Distance {tok.distance} out of DEFLATE range"
 
+    def test_reserved_distance_symbol_is_a_parse_error(self):
+        """Reserved fixed-Huffman distance symbols must not escape as IndexError."""
+        from uhc.core.deflate import deflate_extract_tokens
+
+        compressed = bytes.fromhex("4b2c4dc91cd12f4e4d4d49c4c20600")
+        with pytest.raises(ValueError, match="Reserved DEFLATE distance symbol"):
+            deflate_extract_tokens(compressed)
+
+    def test_reserved_length_and_distance_guards_cover_full_symbol_ranges(self):
+        from uhc.core.deflate import _BitReader, _decode_distance, _decode_length
+
+        reader = _BitReader(b"")
+        for symbol in (256, 286, 287):
+            with pytest.raises(ValueError, match="Reserved DEFLATE length symbol"):
+                _decode_length(symbol, reader)
+        for symbol in (-1, 30, 31):
+            with pytest.raises(ValueError, match="Reserved DEFLATE distance symbol"):
+                _decode_distance(symbol, reader)
+
 
 # ===================================================================
 # Part B: CDH correctness over DEFLATE tokens (Theorem 12)

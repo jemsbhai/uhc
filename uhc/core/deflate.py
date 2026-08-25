@@ -220,6 +220,8 @@ _DISTANCE_TABLE: list[tuple[int, int]] = [
 
 def _decode_length(symbol: int, reader: _BitReader) -> int:
     """Decode match length from length symbol 257-285."""
+    if not 257 <= symbol <= 285:
+        raise ValueError(f"Reserved DEFLATE length symbol: {symbol}")
     idx = symbol - 257
     base, extra = _LENGTH_TABLE[idx]
     if extra > 0:
@@ -229,6 +231,8 @@ def _decode_length(symbol: int, reader: _BitReader) -> int:
 
 def _decode_distance(dist_symbol: int, reader: _BitReader) -> int:
     """Decode distance from distance symbol 0-29."""
+    if not 0 <= dist_symbol <= 29:
+        raise ValueError(f"Reserved DEFLATE distance symbol: {dist_symbol}")
     base, extra = _DISTANCE_TABLE[dist_symbol]
     if extra > 0:
         return base + reader.read_bits(extra)
